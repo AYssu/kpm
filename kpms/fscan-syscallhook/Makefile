@@ -26,8 +26,13 @@ ifdef USE_CLANG
     CLANG_TARGET_FLAGS += -fno-exceptions
     CLANG_TARGET_FLAGS += -fno-asynchronous-unwind-tables
     
-    # Ollvm 混淆选项  -mllvm -fla  -mllvm -split_num=1 -mllvm -bcf -mllvm -bcf_loop=1 -mllvm -bcf_prob=1
-    CLANG_OBFUSCATE_FLAGS = -mllvm -sub -mllvm -split -mllvm -sobf 
+    # Ollvm 混淆选项
+    # 注意：不能使用 -sobf (字符串混淆)，会导致 kallsyms_lookup_name 查找失败
+    # -sub: 指令替换  -split: 基本块分割
+    # -fla: 控制流平坦化 (会大幅增加代码体积，慎用)
+    # -bcf: 虚假控制流 (同样会增加体积)
+    CLANG_OBFUSCATE_FLAGS = -mllvm -sub -mllvm -split
+    
     # 符号混淆选项
     CLANG_SYMBOL_FLAGS = -fvisibility=hidden -fno-dwarf2-cfi-asm
     

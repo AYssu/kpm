@@ -54,7 +54,7 @@ KPM_DESCRIPTION("FastScan专用内存读取模块?");
 
 // ======================== 日志控制开关 ========================
 // 定义 ENABLE_DEBUG_LOG 为 1 启用日志，为 0 禁用日志
-#define ENABLE_DEBUG_LOG 1
+#define ENABLE_DEBUG_LOG 0
 
 #if ENABLE_DEBUG_LOG
     #define TAG "[FastScan] "
