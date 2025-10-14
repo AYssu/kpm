@@ -19,7 +19,7 @@
  #include <linux/sched.h>
  #include <linux/mm_types.h>
  #include <linux/errno.h>
- #include <limits.h>
+//  #include <limits.h>
  
  // ioctl 宏定义（直接定义，避免头文件依赖）
  #ifndef _IOC_NRBITS
@@ -148,13 +148,7 @@ static inline void __iounmap(void __iomem *addr)
     kfunc_call_void(__iounmap, addr);
 }
 
-void __iomem *kfunc_def(__ioremap)(resource_size_t offset, unsigned long size);
-static inline void __iomem *__ioremap(resource_size_t offset, unsigned long size)
-{
-    kfunc_call(__ioremap, offset, size);
-    kfunc_not_found();
-    return NULL;
-}
+
 
 void __iomem *kfunc_def(ioremap_cache)(resource_size_t offset, unsigned long size);
 static inline void __iomem *ioremap_cache(resource_size_t offset, unsigned long size)
@@ -256,37 +250,26 @@ static uintptr_t _pid_virt_to_phys(pid_t pid, uintptr_t addr)
 static size_t read_physical_address(phys_addr_t pa, void __user *buffer, size_t size)
 {
     void __iomem *mapped;
-    int ret;
-    
     // 验证物理地址
     if (!pfn_valid(__phys_to_pfn(pa))) {
         logv("Invalid PFN for pa=0x%llx\n", pa);
         return 0;
     }
-    
     if (!valid_phys_addr_range(pa, size)) {
         logv("Invalid physical address range: pa=0x%llx, size=%zu\n", pa, size);
         return 0;
     }
-    
     // 映射物理内存 - 使用 ioremap_cache
     mapped = ioremap_cache(pa, size);
     if (!mapped) {
         logv("Failed to ioremap_cache: pa=0x%llx, size=%zu\n", pa, size);
         return 0;
     }
-    
     // 复制到用户空间
-    ret = compat_copy_to_user(buffer, (const void *)mapped, size);
-    
+     compat_copy_to_user(buffer, (const void *)mapped, size);
     // 解除映射
     __iounmap(mapped);
-    
-    if (ret != 0) {
-        logv("copy_to_user failed: %d\n", ret);
-        return 0;
-    }
-    
+   
     return size;
 }
 
@@ -342,7 +325,7 @@ static int read_mem(pid_t pid, uintptr_t addr, void __user *buffer, size_t size)
         logv("Partially read %zu/%zu bytes\n", total_read, size);
         return 0; // 返回成功，即使只读取部分
     } else {
-        logv("Failed to read any data %zy/%zu\n", total_read, size);
+        logv("Failed to read any data %zu/%zu\n", total_read, size);
         return -1;
     }
 }
@@ -402,7 +385,6 @@ static long syscall_hook_demo_init(const char *args, const char *event, void *__
     kfunc_lookup_name(get_task_mm);
     kfunc_lookup_name(valid_phys_addr_range);
     kfunc_lookup_name(pfn_valid);
-    kfunc_lookup_name(__ioremap);
     kfunc_lookup_name(ioremap_cache);
     kfunc_lookup_name(__iounmap);
     logv("All kernel functions resolved\n");
