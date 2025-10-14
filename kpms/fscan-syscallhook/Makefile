@@ -26,9 +26,12 @@ ifdef USE_CLANG
     CLANG_TARGET_FLAGS += -fno-exceptions
     CLANG_TARGET_FLAGS += -fno-asynchronous-unwind-tables
     
-    # Ollvm 混淆选项
- CLANG_OBFUSCATE_FLAGS = -mllvm -sobf -mllvm -fla 
-    CFLAGS += $(CLANG_TARGET_FLAGS) $(CLANG_OBFUSCATE_FLAGS)
+    # Ollvm 混淆选项  -mllvm -fla  -mllvm -split_num=1 -mllvm -bcf -mllvm -bcf_loop=1 -mllvm -bcf_prob=1
+    CLANG_OBFUSCATE_FLAGS = -mllvm -sub -mllvm -split -mllvm -sobf 
+    # 符号混淆选项
+    CLANG_SYMBOL_FLAGS = -fvisibility=hidden -fno-dwarf2-cfi-asm
+    
+    CFLAGS += $(CLANG_TARGET_FLAGS) $(CLANG_OBFUSCATE_FLAGS) $(CLANG_SYMBOL_FLAGS)
     CFLAGS += -Wall -std=gnu11
 endif
 
@@ -42,6 +45,8 @@ all: fscan.kpm
 fscan.kpm: ${objs}
 ifdef USE_CLANG
 	${LD} -r -o $@ $^
+	@echo "Stripping symbols for obfuscation..."
+	$(CLANG_PATH:clang=llvm-strip) --strip-unneeded $@ 2>/dev/null || true
 else
 	${CC} -r -o $@ $^
 endif

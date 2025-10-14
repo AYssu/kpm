@@ -20,7 +20,7 @@
  #include <linux/mm_types.h>
  #include <linux/errno.h>
 //  #include <limits.h>
- 
+ #include "obfuscate.h"
  // ioctl 宏定义（直接定义，避免头文件依赖）
  #ifndef _IOC_NRBITS
  #define _IOC_NRBITS     8
@@ -46,18 +46,25 @@
  #define _IOWR(type,nr,size) _IOC(_IOC_READ|_IOC_WRITE,(type),(nr),sizeof(size))
  #endif
  
- KPM_NAME("FastScan");
- KPM_VERSION("1.0.0");
- KPM_LICENSE("GPL v2");
- KPM_AUTHOR("AYssu");
- KPM_DESCRIPTION("FastScan专用内存读取模块?");
- 
- // Log macros with unified TAG
- #define TAG "[FastScan] "
- #define logv(fmt, ...) pr_info(TAG fmt, ##__VA_ARGS__)
+KPM_NAME("FastScan");
+KPM_VERSION("1.0.0");
+KPM_LICENSE("GPL v2");
+KPM_AUTHOR("AYssu");
+KPM_DESCRIPTION("FastScan专用内存读取模块?");
+
+// ======================== 日志控制开关 ========================
+// 定义 ENABLE_DEBUG_LOG 为 1 启用日志，为 0 禁用日志
+#define ENABLE_DEBUG_LOG 1
+
+#if ENABLE_DEBUG_LOG
+    #define TAG "[FastScan] "
+    #define logv(fmt, ...) pr_info(TAG fmt, ##__VA_ARGS__)
+#else
+    #define logv(fmt, ...) do {} while(0)  // 日志关闭时不输出
+#endif
+// ============================================================
  
  // ioctl command definitions
- #define FASTSCAN_MAGIC 29  // FastScan magic number
  #define OP_READ_MEM    777
  #define OP_WRITE_MEM   778
  
@@ -148,14 +155,21 @@ static inline void __iounmap(void __iomem *addr)
     kfunc_call_void(__iounmap, addr);
 }
 
-
-
 void __iomem *kfunc_def(ioremap_cache)(resource_size_t offset, unsigned long size);
 static inline void __iomem *ioremap_cache(resource_size_t offset, unsigned long size)
 {
     kfunc_call(ioremap_cache, offset, size);
     kfunc_not_found();
     return NULL;
+}
+
+// 获取当前时间戳（秒）- 使用 s64 代替 time64_t
+s64 kfunc_def(ktime_get_real_seconds)(void);
+static inline s64 ktime_get_real_seconds(void)
+{
+    kfunc_call(ktime_get_real_seconds);
+    kfunc_not_found();
+    return 0;
 }
 
 // 虚拟地址转物理地址 - 使用 KPM 提供的安全函数
@@ -337,12 +351,35 @@ static int read_mem(pid_t pid, uintptr_t addr, void __user *buffer, size_t size)
      int fd = (int)syscall_argn(args, 0);
      unsigned long cmd = (unsigned long)syscall_argn(args, 1);
      unsigned long arg = (unsigned long)syscall_argn(args, 2);
+     s64 current_timestamp;
+     s64 received_timestamp;
+     s64 time_diff;
+     struct mem_operation cm;
+     int result;
  
- 
+    // 时间戳验证：fd作为时间戳传入，验证是否在10秒时间窗口内
+    current_timestamp = ktime_get_real_seconds();
+    received_timestamp = (s64)fd;
+    
+    // 计算时间差的绝对值
+    if (current_timestamp > received_timestamp) {
+        time_diff = current_timestamp - received_timestamp;
+    } else {
+        time_diff = received_timestamp - current_timestamp;
+    }
+    
+    // 检查时间窗口（10秒）
+    if (time_diff > 10) {
+
+        args->ret = -EPERM;  // Permission denied
+        return;
+    }
+    
+
     // 只处理我们关心的 ioctl 命令
     if (cmd == OP_READ_MEM) {
-        struct mem_operation cm;
-        
+         logv("Timestamp validation passed: diff=%lld seconds\n", time_diff);
+
         // 从用户空间复制参数
         if (__arch_copy_from_user(&cm, (void __user *)arg, sizeof(cm)) != 0) {
             logv("ioctl: failed to copy mem_operation from user\n");
@@ -354,7 +391,7 @@ static int read_mem(pid_t pid, uintptr_t addr, void __user *buffer, size_t size)
              fd, cm.target_pid, cm.addr, cm.size);
         
         // 调用读取函数
-        int result = read_mem(cm.target_pid, cm.addr, cm.buffer, cm.size);
+        result = read_mem(cm.target_pid, cm.addr, cm.buffer, cm.size);
         
         if (result == 0) {
             logv("Read operation successful\n");
@@ -387,6 +424,7 @@ static long syscall_hook_demo_init(const char *args, const char *event, void *__
     kfunc_lookup_name(pfn_valid);
     kfunc_lookup_name(ioremap_cache);
     kfunc_lookup_name(__iounmap);
+    kfunc_lookup_name(ktime_get_real_seconds);
     logv("All kernel functions resolved\n");
 
     hook_err_t err = HOOK_NO_ERR;
