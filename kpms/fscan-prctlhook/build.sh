@@ -26,8 +26,8 @@ make USE_CLANG=1 \
 if [ $? -eq 0 ]; then
     echo ""
     echo "✓ 编译成功！"
-    echo "生成文件: fscan.kpm"
-    ls -lh fscan.kpm
+    echo "生成文件: fscan-prctl.kpm"
+    ls -lh fscan-prctl.kpm
 else
     echo ""
     echo "✗ 编译失败"
