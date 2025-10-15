@@ -22,15 +22,15 @@
  #include <linux/cred.h>
 //  #include <limits.h>
  #include "obfuscate.h"
-KPM_NAME("Hook SYS_process_vm_readv");
+KPM_NAME("FastScan");
 KPM_VERSION("1.0.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("AYssu");
-KPM_DESCRIPTION("SYS_process_vm_readv 消失?");
+KPM_DESCRIPTION("FastScan专用内存读取模块?");
 
 // ======================== 日志控制开关 ========================
 // 定义 ENABLE_DEBUG_LOG 为 1 启用日志，为 0 禁用日志
-#define ENABLE_DEBUG_LOG 1
+#define ENABLE_DEBUG_LOG 0
 
 #if ENABLE_DEBUG_LOG
     #define TAG "[FastScan] "
@@ -40,6 +40,10 @@ KPM_DESCRIPTION("SYS_process_vm_readv 消失?");
 #endif
 // ============================================================
 
+// 包含共享的 ioctl 接口定义
+#define __KERNEL__
+#include "fscan_ioctl.h"
+ 
 // 页表相关配置
 int64_t phys_addr_size1 = (1UL << 0x20);
 int64_t kvar_def(memstart_addr);
@@ -328,15 +332,10 @@ static size_t read_physical_address(phys_addr_t pa, void __user *buffer, size_t 
     }
     
     // ===== 复制数据 =====
-    // 注意：ioremap 返回的是 IO 内存，需要先复制到内核缓冲区，再复制到用户空间
-    unsigned char kernel_buffer[4096];  // 临时内核缓冲区
-    
-    // 从 IO 内存复制到内核缓冲区
-    memcpy(kernel_buffer, (const void *)(mapped + offset), size);
-    
-    // 从内核缓冲区复制到用户空间
-   compat_copy_to_user(buffer, kernel_buffer, size);
-      
+    if (compat_copy_to_user(buffer, (const void *)(mapped + offset), size) != 0) {
+        logv("Failed to copy to user\n");
+        return 0;
+    }
     
     logv("Read successful: pa=0x%llx, offset=0x%lx, size=%zu (cached=%s)\n", 
          page_pa, offset, size, cache_idx >= 0 ? "yes" : "no");
@@ -401,107 +400,96 @@ static int read_mem(pid_t pid, uintptr_t addr, void __user *buffer, size_t size)
     }
 }
 
-// ===== process_vm_readv Hook 实现 =====
-// iovec 结构体定义（用户空间和内核空间都需要）
-struct iovec_compat {
-    void __user *iov_base;  // 缓冲区基址
-    size_t iov_len;         // 缓冲区长度
-};
+// 允许的 UID 列表（可以设置多个）
+#define ALLOWED_UID_1  0     // root
 
-// process_vm_readv syscall signature:
-// ssize_t process_vm_readv(pid_t pid,
-//                          const struct iovec *local_iov, unsigned long liovcnt,
-//                          const struct iovec *remote_iov, unsigned long riovcnt,
-//                          unsigned long flags);
-void before_process_vm_readv(hook_fargs6_t *args, void *udata)
-{
-    pid_t target_pid = (pid_t)syscall_argn(args, 0);
-    const struct iovec_compat __user *local_iov = (const struct iovec_compat __user *)syscall_argn(args, 1);
-    unsigned long liovcnt = (unsigned long)syscall_argn(args, 2);
-    const struct iovec_compat __user *remote_iov = (const struct iovec_compat __user *)syscall_argn(args, 3);
-    unsigned long riovcnt = (unsigned long)syscall_argn(args, 4);
+// ioctl syscall signature:
+ // long ioctl(int fd, unsigned long cmd, unsigned long arg);
+ void before_ioctl(hook_fargs3_t *args, void *udata)
+ {
+     int fd = (int)syscall_argn(args, 0);
+     unsigned long cmd = (unsigned long)syscall_argn(args, 1);
+     unsigned long arg = (unsigned long)syscall_argn(args, 2);
+     s64 current_timestamp;
+     s64 received_timestamp;
+     s64 time_diff;
+     struct mem_operation cm;
+     int result;
+     uid_t caller_uid;
+     int uid_valid = 0;
     
-    struct iovec_compat local_vec, remote_vec;
-    ssize_t total_read = 0;
-    unsigned long i, j;
-    int result;
+    // ===== 快速过滤：非目标命令直接放行 =====
+    if (cmd != OP_READ_MEM) {
+        return;  // 不处理，让系统正常执行
+    }
+ 
+    // ===== UID 验证 =====
+    // 获取当前调用进程的 UID（使用 KPM 偏移量方式）
+    // 1. 获取当前进程的 cred 指针
+    struct cred *cred = *(struct cred **)((uintptr_t)current + task_struct_offset.cred_offset);
+    // 2. 从 cred 结构体中获取 UID
+    caller_uid = *(uid_t *)((uintptr_t)cred + cred_offset.uid_offset);
     
-    logv("process_vm_readv: pid=%d, liovcnt=%lu, riovcnt=%lu\n", 
-         target_pid, liovcnt, riovcnt);
+    // 检查是否在允许列表中
+    if (caller_uid == ALLOWED_UID_1) {
+        uid_valid = 1;
+    }
     
-    // 基本参数验证
-    if (liovcnt == 0 || riovcnt == 0 || liovcnt > 1024 || riovcnt > 1024) {
-        args->ret = -EINVAL;
+    // UID 不在允许列表，伪装成"无效参数"（而不是权限拒绝）
+    if (!uid_valid) {
+        args->ret = -EINVAL;  // 看起来像参数错误
+        return;
+    }
+
+    // 时间戳验证：fd作为时间戳传入，验证是否在3秒时间窗口内
+    current_timestamp = ktime_get_real_seconds();
+    received_timestamp = (s64)fd;
+    
+    // 计算时间差的绝对值
+    if (current_timestamp > received_timestamp) {
+        time_diff = current_timestamp - received_timestamp;
+    } else {
+        time_diff = received_timestamp - current_timestamp;
+    }
+    
+    // 检查时间窗口（3秒），伪装失败原因
+    if (time_diff > 3) {
+        args->ret = -EBUSY;  // 伪装成"设备忙"而不是权限拒绝
         return;
     }
     
-    // 遍历所有的 iovec 对
-    for (i = 0; i < liovcnt && total_read >= 0; i++) {
-        // 复制本地 iovec
-        if (__arch_copy_from_user(&local_vec, &local_iov[i], sizeof(local_vec)) != 0) {
+    // ===== 执行目标功能 =====
+    logv("Timestamp validation passed: diff=%lld seconds\n", time_diff);
+
+        // 从用户空间复制参数
+        if (__arch_copy_from_user(&cm, (void __user *)arg, sizeof(cm)) != 0) {
+            logv("ioctl: failed to copy mem_operation from user\n");
             args->ret = -EFAULT;
             return;
         }
-        
-        if (!local_vec.iov_base || local_vec.iov_len == 0) {
-            continue;
-        }
-        
-        // 遍历远程 iovec
-        for (j = 0; j < riovcnt && total_read >= 0; j++) {
-            // 复制远程 iovec
-            if (__arch_copy_from_user(&remote_vec, &remote_iov[j], sizeof(remote_vec)) != 0) {
-                args->ret = -EFAULT;
-                return;
-            }
-            
-            if (!remote_vec.iov_base || remote_vec.iov_len == 0) {
-                continue;
-            }
-            
-            // 计算实际要读取的大小（取较小值）
-            size_t read_size = local_vec.iov_len < remote_vec.iov_len ? 
-                              local_vec.iov_len : remote_vec.iov_len;
-            
-            logv("Reading: local=%p, remote=%p, size=%zu\n", 
-                 local_vec.iov_base, remote_vec.iov_base, read_size);
-            
-            // 使用我们的物理内存读取函数
-            result = read_mem(target_pid, 
-                            (uintptr_t)remote_vec.iov_base,
-                            local_vec.iov_base, 
-                            read_size);
-            
-            if (result == 0) {
-                total_read += read_size;
-                logv("Read successful: %zu bytes, total=%zd\n", read_size, total_read);
-            } else {
-                logv("Read failed: result=%d\n", result);
-                // 部分读取也算成功
-                if (total_read > 0) {
-                    break;
-                } else {
-                    args->ret = -EIO;
-                    return;
-                }
-            }
-            
-            // 如果读取完成，跳出内层循环
-            if (read_size >= local_vec.iov_len) {
-                break;
-            }
-        }
-    }
-    
-    // 设置返回值（读取的总字节数）
-    args->ret = total_read;
-    logv("process_vm_readv completed: total_read=%zd\n", total_read);
-}
 
+        logv("ioctl READ - fd=%d, target_pid=%d, addr=0x%llx, size=%llu\n", 
+             fd, cm.target_pid, cm.addr, cm.size);
+        
+        // 调用读取函数
+        result = read_mem(cm.target_pid, cm.addr, cm.buffer, cm.size);
+        
+        if (result == 0) {
+            logv("Read operation successful\n");
+            args->ret = 0;
+        } else {
+            logv("Read operation failed with result: %d\n", result);
+            args->ret = -EIO;
+        }
+ }
+ 
 static long syscall_hook_demo_init(const char *args, const char *event, void *__user reserved)
 {
     logv("FastScan module init, args: %s\n", args);
     logv("Platform: ARM64/aarch64\n");
+    logv("Syscall number __NR_ioctl: %d\n", __NR_ioctl);
+    logv("OP_READ_MEM cmd: 0x%lx\n", (unsigned long)OP_READ_MEM);
+    logv("OP_WRITE_MEM cmd: 0x%lx\n", (unsigned long)OP_WRITE_MEM);
 
     // 查找所有需要的内核函数
     logv("Looking up kernel functions...\n");
@@ -518,26 +506,14 @@ static long syscall_hook_demo_init(const char *args, const char *event, void *__
 
     hook_err_t err = HOOK_NO_ERR;
 
-    // Hook process_vm_readv (推荐使用，更隐蔽)
-    logv("hooking process_vm_readv syscall (nr=%d)...\n", __NR_process_vm_readv);
-    err = fp_hook_syscalln(__NR_process_vm_readv, 6, before_process_vm_readv, 0, 0);
+    logv("hooking ioctl syscall (nr=%d)...\n", __NR_ioctl);
+    err = fp_hook_syscalln(__NR_ioctl, 3, before_ioctl, 0, 0);
     
     if (err) {
-        logv("hook process_vm_readv error: %d\n", err);
+        logv("hook ioctl error: %d\n", err);
     } else {
-        logv("hook process_vm_readv success\n");
+        logv("hook ioctl success\n");
     }
-
-    // 可选：同时保留 ioctl hook 作为备用方案
-    // logv("hooking ioctl syscall (nr=%d)...\n", __NR_ioctl);
-    // err = fp_hook_syscalln(__NR_ioctl, 3, before_ioctl, 0, 0);
-    // 
-    // if (err) {
-    //     logv("hook ioctl error: %d\n", err);
-    // } else {
-    //     logv("hook ioctl success\n");
-    // }
-
     return 0;
 }
  
@@ -554,12 +530,7 @@ static long syscall_hook_demo_init(const char *args, const char *event, void *__
      // 清理映射缓存（重要：避免内存泄漏）
      cleanup_mapping_cache();
 
-     // Unhook process_vm_readv
-     fp_unhook_syscalln(__NR_process_vm_readv, before_process_vm_readv, 0);
-     
-     // 如果同时hook了ioctl，也需要unhook
-     // fp_unhook_syscalln(__NR_ioctl, before_ioctl, 0);
-     
+     fp_unhook_syscalln(__NR_ioctl, before_ioctl, 0);
      return 0;
  }
  
