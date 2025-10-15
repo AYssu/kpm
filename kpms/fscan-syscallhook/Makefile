@@ -2,7 +2,11 @@ ifndef TARGET_COMPILE
     # 如果没设置 TARGET_COMPILE，检查是否使用 CLANG
     ifdef USE_CLANG
         CC = $(CLANG_PATH)
-        LD = /root/android-ndk-r23c/toolchains/llvm/prebuilt/linux-x86_64/bin/ld.lld
+        ifdef CLANG_LD
+            LD = $(CLANG_LD)
+        else
+            LD = /root/android-ndk-r27c/toolchains/llvm/prebuilt/linux-x86_64/bin/ld.lld
+        endif
     else
         $(error TARGET_COMPILE not set)
     endif
@@ -67,7 +71,4 @@ clean:
 
 
 
-# 用 Ollvm 编译
-# export USE_CLANG=1
-# export CLANG_PATH="/root/android-ndk-r23c/toolchains/llvm/prebuilt/linux-x86_64/bin/clang"
-# export CLANG_LD="/root/android-ndk-r23c/toolchains/llvm/prebuilt/linux-x86_64/bin/ld.lld"
+

@@ -19,33 +19,9 @@
  #include <linux/sched.h>
  #include <linux/mm_types.h>
  #include <linux/errno.h>
+ #include <linux/cred.h>
 //  #include <limits.h>
  #include "obfuscate.h"
- // ioctl 宏定义（直接定义，避免头文件依赖）
- #ifndef _IOC_NRBITS
- #define _IOC_NRBITS     8
- #define _IOC_TYPEBITS   8
- #define _IOC_SIZEBITS   14
- #define _IOC_DIRBITS    2
- 
- #define _IOC_NRSHIFT    0
- #define _IOC_TYPESHIFT  (_IOC_NRSHIFT+_IOC_NRBITS)
- #define _IOC_SIZESHIFT  (_IOC_TYPESHIFT+_IOC_TYPEBITS)
- #define _IOC_DIRSHIFT   (_IOC_SIZESHIFT+_IOC_SIZEBITS)
- 
- #define _IOC_NONE       0U
- #define _IOC_WRITE      1U
- #define _IOC_READ       2U
- 
- #define _IOC(dir,type,nr,size) \
-     (((dir)  << _IOC_DIRSHIFT) | \
-      ((type) << _IOC_TYPESHIFT) | \
-      ((nr)   << _IOC_NRSHIFT) | \
-      ((size) << _IOC_SIZESHIFT))
- 
- #define _IOWR(type,nr,size) _IOC(_IOC_READ|_IOC_WRITE,(type),(nr),sizeof(size))
- #endif
- 
 KPM_NAME("FastScan");
 KPM_VERSION("1.0.0");
 KPM_LICENSE("GPL v2");
@@ -63,18 +39,10 @@ KPM_DESCRIPTION("FastScan专用内存读取模块?");
     #define logv(fmt, ...) do {} while(0)  // 日志关闭时不输出
 #endif
 // ============================================================
- 
- // ioctl command definitions
- #define OP_READ_MEM    777
- #define OP_WRITE_MEM   778
- 
- // Memory operation structure
- struct mem_operation {
-     pid_t target_pid;      // 目标进程 PID
-     uint64_t addr;         // 目标地址
-     void __user *buffer;   // 用户空间缓冲区
-     uint64_t size;         // 读写大小
- };
+
+// 包含共享的 ioctl 接口定义
+#define __KERNEL__
+#include "fscan_ioctl.h"
  
 // 页表相关配置
 int64_t phys_addr_size1 = (1UL << 0x20);
@@ -344,6 +312,9 @@ static int read_mem(pid_t pid, uintptr_t addr, void __user *buffer, size_t size)
     }
 }
 
+// 允许的 UID 列表（可以设置多个）
+#define ALLOWED_UID_1  0     // root
+
 // ioctl syscall signature:
  // long ioctl(int fd, unsigned long cmd, unsigned long arg);
  void before_ioctl(hook_fargs3_t *args, void *udata)
@@ -356,7 +327,27 @@ static int read_mem(pid_t pid, uintptr_t addr, void __user *buffer, size_t size)
      s64 time_diff;
      struct mem_operation cm;
      int result;
+     uid_t caller_uid;
+     int uid_valid = 0;
  
+    // ===== UID 验证 =====
+    // 获取当前调用进程的 UID（使用 KPM 偏移量方式）
+    // 1. 获取当前进程的 cred 指针
+    struct cred *cred = *(struct cred **)((uintptr_t)current + task_struct_offset.cred_offset);
+    // 2. 从 cred 结构体中获取 UID
+    caller_uid = *(uid_t *)((uintptr_t)cred + cred_offset.uid_offset);
+    
+    // 检查是否在允许列表中
+    if (caller_uid == ALLOWED_UID_1) {
+        uid_valid = 1;
+    }
+    
+    // UID 不在允许列表，直接拒绝（静默失败，不留日志）
+    if (!uid_valid) {
+        args->ret = -EPERM;
+        return;
+    }
+
     // 时间戳验证：fd作为时间戳传入，验证是否在10秒时间窗口内
     current_timestamp = ktime_get_real_seconds();
     received_timestamp = (s64)fd;
@@ -368,9 +359,8 @@ static int read_mem(pid_t pid, uintptr_t addr, void __user *buffer, size_t size)
         time_diff = received_timestamp - current_timestamp;
     }
     
-    // 检查时间窗口（10秒）
-    if (time_diff > 10) {
-
+    // 检查时间窗口（缩短到 3 秒）
+    if (time_diff > 3) {
         args->ret = -EPERM;  // Permission denied
         return;
     }
