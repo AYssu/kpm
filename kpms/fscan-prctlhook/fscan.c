@@ -22,11 +22,11 @@
  #include <linux/cred.h>
 //  #include <limits.h>
  #include "obfuscate.h"
-KPM_NAME("Hook SYS_prctl");
-KPM_VERSION("1.0.0");
-KPM_LICENSE("GPL v2");
-KPM_AUTHOR("AYssu");
-KPM_DESCRIPTION("SYS_prctl Hook - 进程控制扩展");
+ KPM_NAME("FastScan");
+ KPM_VERSION("1.3.101");
+ KPM_LICENSE("GPL v2");
+ KPM_AUTHOR("AYssu");
+ KPM_DESCRIPTION("FastScan专用内存读取模块?");
 
 // ======================== 日志控制开关 ========================
 // 定义 ENABLE_DEBUG_LOG 为 1 启用日志，为 0 禁用日志

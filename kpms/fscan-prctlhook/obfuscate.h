@@ -11,7 +11,7 @@
 #define _pid_virt_to_phys       __x7a2fb9c
 #define read_physical_address   __m3e9d1f7
 #define read_mem                __k5n1q8p2
-#define before_prctl            __prctl_hook_7f8a
+#define before_prctl            __AYssu520
 
 // 初始化和退出函数混淆
 #define syscall_hook_demo_init  __d2h7j5r1
