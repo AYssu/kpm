@@ -343,6 +343,105 @@ static size_t read_physical_address(phys_addr_t pa, void __user *buffer, size_t 
     return size;
 }
 
+// 写入物理地址 - 使用缓存优化（与read_physical_address对应）
+static size_t write_physical_address(phys_addr_t pa, const void __user *buffer, size_t size)
+{
+    void __iomem *mapped = NULL;
+    int cache_idx = -1;
+    int empty_idx = -1;
+    int oldest_idx = 0;
+    s64 now = ktime_get_real_seconds();  // 秒级时间戳
+    s64 oldest_time = now;
+    phys_addr_t page_pa;
+    unsigned long offset;
+    int i;
+    
+    // 验证物理地址
+    if (!pfn_valid(__phys_to_pfn(pa))) {
+        logv("Write: Invalid PFN for pa=0x%llx\n", pa);
+        return 0;
+    }
+    
+    // 计算页对齐的物理地址
+    page_pa = pa & PAGE_MASK;
+    offset = pa & (PAGE_SIZE - 1);
+    
+    // 确保写入不跨页
+    if (offset + size > PAGE_SIZE) {
+        size = PAGE_SIZE - offset;
+    }
+    
+    // ===== 查找缓存 =====
+    for (i = 0; i < MAPPING_CACHE_SIZE; i++) {
+        if (mapping_cache[i].vaddr) {
+            // 检查是否命中（同一页）
+            if (mapping_cache[i].pa == page_pa) {
+                cache_idx = i;
+                mapping_cache[i].last_use = now;
+                mapped = mapping_cache[i].vaddr;
+                logv("Write cache hit! idx=%d, pa=0x%llx\n", i, page_pa);
+                break;
+            }
+            // 记录最旧的缓存
+            if (mapping_cache[i].last_use < oldest_time) {
+                oldest_time = mapping_cache[i].last_use;
+                oldest_idx = i;
+            }
+            // 清理过期缓存（超过2秒未使用）
+            if (now - mapping_cache[i].last_use > 2) {  // 2秒
+                __iounmap(mapping_cache[i].vaddr);
+                mapping_cache[i].vaddr = NULL;
+                mapping_cache[i].pa = 0;
+                empty_idx = i;
+                logv("Write cache expired: idx=%d\n", i);
+            }
+        } else if (empty_idx < 0) {
+            empty_idx = i;
+        }
+    }
+    
+    // ===== 缓存未命中，创建新映射 =====
+    if (!mapped) {
+        logv("Write cache miss, creating new mapping for pa=0x%llx\n", page_pa);
+        
+        // 选择缓存槽：优先空槽，否则替换最旧的
+        if (empty_idx >= 0) {
+            cache_idx = empty_idx;
+        } else {
+            cache_idx = oldest_idx;
+            // 清理旧映射
+            if (mapping_cache[cache_idx].vaddr) {
+                __iounmap(mapping_cache[cache_idx].vaddr);
+                logv("Write evicting old cache: idx=%d\n", cache_idx);
+            }
+        }
+        
+        // 创建新映射（按页大小映射，提高缓存命中率）
+        mapped = ioremap_cache(page_pa, PAGE_SIZE);
+        if (!mapped) {
+            logv("Write failed to ioremap_cache: pa=0x%llx\n", page_pa);
+            return 0;
+        }
+        
+        // 保存到缓存
+        mapping_cache[cache_idx].pa = page_pa;
+        mapping_cache[cache_idx].vaddr = mapped;
+        mapping_cache[cache_idx].last_use = now;
+        logv("Write new mapping cached: idx=%d, pa=0x%llx\n", cache_idx, page_pa);
+    }
+    
+    // ===== 复制数据（关键区别：从用户空间复制到内核映射的物理内存）=====
+    if (__arch_copy_from_user((void *)(mapped + offset), buffer, size) != 0) {
+        logv("Failed to copy from user\n");
+        return 0;
+    }
+    
+    logv("Write successful: pa=0x%llx, offset=0x%lx, size=%zu (cached=%s)\n", 
+         page_pa, offset, size, cache_idx >= 0 ? "yes" : "no");
+    
+    return size;
+}
+
 // 核心读取函数 - 分页读取，避免跨页问题
 static int read_mem(pid_t pid, uintptr_t addr, void __user *buffer, size_t size)
 {
@@ -396,6 +495,63 @@ static int read_mem(pid_t pid, uintptr_t addr, void __user *buffer, size_t size)
         return 0; // 返回成功，即使只读取部分
     } else {
         logv("Failed to read any data %zu/%zu\n", total_read, size);
+        return -1;
+    }
+}
+
+// 核心写入函数 - 分页写入，避免跨页问题
+static int write_mem(pid_t pid, uintptr_t addr, const void __user *buffer, size_t size)
+{
+    phys_addr_t pa;
+    size_t max;
+    size_t total_written = 0;
+    size_t bytes_written;
+    uintptr_t current_addr = addr;
+    const void __user *current_buffer = buffer;
+    size_t remaining = size;
+    
+    logv("write_mem: pid=%d, addr=0x%lx, size=%zu\n", pid, addr, size);
+    
+    // 分页写入，避免跨页问题
+    while (remaining > 0) {
+        // 计算当前页最多能写入多少字节
+        max = PAGE_SIZE - (current_addr & (PAGE_SIZE - 1));
+        if (max > remaining) {
+            max = remaining;
+        }
+        
+        logv("Writing chunk: addr=0x%lx, size=%zu\n", current_addr, max);
+        
+        // 虚拟地址转物理地址
+        pa = _pid_virt_to_phys(pid, current_addr);
+        if (!pa) {
+            logv("Virtual to physical translation failed for addr=0x%lx\n", current_addr);
+            // 跳过这一部分，继续下一页
+            goto next_chunk;
+        }
+        
+        // 写入这一页
+        bytes_written = write_physical_address(pa, current_buffer, max);
+        if (bytes_written > 0) {
+            total_written += bytes_written;
+        } else {
+            logv("Failed to write physical address 0x%llx\n", pa);
+        }
+        
+    next_chunk:
+        remaining -= max;
+        current_addr += max;
+        current_buffer += max;
+    }
+    
+    if (total_written == size) {
+        logv("Successfully wrote all %zu bytes\n", size);
+        return 0;
+    } else if (total_written > 0) {
+        logv("Partially wrote %zu/%zu bytes\n", total_written, size);
+        return 0; // 返回成功，即使只写入部分
+    } else {
+        logv("Failed to write any data %zu/%zu\n", total_written, size);
         return -1;
     }
 }
@@ -460,9 +616,16 @@ void before_prctl(hook_fargs5_t *args, void *udata)
         }
     } 
     else if (option == PRCTL_MEM_WRITE) {
-        // 写入内存（暂未实现）
-        logv("prctl write not implemented\n");
-        args->ret = -ENOSYS;  // 功能未实现
+        // 写入内存
+        result = write_mem(op.target_pid, op.addr, op.buffer, op.size);
+        
+        if (result == 0) {
+            logv("prctl write operation successful\n");
+            args->ret = 0;  // 成功
+        } else {
+            logv("prctl write operation failed: %d\n", result);
+            args->ret = -EIO;  // 失败
+        }
     }
 }
  
