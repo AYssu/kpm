@@ -17,3 +17,5 @@
 *.elf
 
 *.kpm
+/build
+/cmake-build-debug
