@@ -41,17 +41,30 @@ struct process_pid {
     pid_t pid;             // 返回的进程 PID（内核回写）
 };
 
+// 模块基址查询结构体
+struct module_base {
+    pid_t pid;             // 输入：目标进程 PID
+#ifdef __KERNEL__
+    char __user *module_name; // 内核空间：用户空间字符串指针
+#else
+    char *module_name;     // 用户空间：模块名字符串
+#endif
+    uint64_t base_address; // 输出：模块基址（内核回写）
+};
+
 // prctl 命令定义
 // 使用不常见的 option 值，伪装成自定义进程控制
 // "MEM" 的 ASCII 码 + 操作类型
 #define PRCTL_MEM_READ      0x4D454D01  // "MEM\x01" 
 #define PRCTL_MEM_WRITE     0x4D454D02  // "MEM\x02"
 #define PRCTL_PROCESS_PID   0x4D454D03  // "MEM\x03" - 获取进程PID
+#define PRCTL_MODULE_BASE   0x4D454D04  // "MEM\x04" - 获取模块基址
 
 // 为了兼容性，也可以使用这些别名
 #define OP_READ_MEM      PRCTL_MEM_READ
 #define OP_WRITE_MEM     PRCTL_MEM_WRITE
 #define OP_GET_PID       PRCTL_PROCESS_PID
+#define OP_MODULE_BASE   PRCTL_MODULE_BASE
 
 // 命令码说明:
 // 0x4D454D01 = 1297239809 (十进制)
