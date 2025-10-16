@@ -134,6 +134,8 @@ static inline s64 ktime_get_real_seconds(void)
     return 0;
 }
 
+// 注意：__task_pid_nr_ns 已经在 linux/sched.h 中定义，直接使用即可
+
 // 虚拟地址转物理地址 - 使用 KPM 提供的安全函数
 static uintptr_t _pid_virt_to_phys(pid_t pid, uintptr_t addr) 
 {
@@ -556,6 +558,49 @@ static int write_mem(pid_t pid, uintptr_t addr, const void __user *buffer, size_
     }
 }
 
+// 根据进程名获取进程PID
+static pid_t get_process_pid(const char *name)
+{
+    pid_t ipid = -1;
+    struct task_struct *task = NULL;
+    int pid;
+    
+    if (!name) {
+        logv("get_process_pid: name is NULL\n");
+        return -1;
+    }
+    
+    logv("get_process_pid: searching for process '%s'\n", name);
+    
+    // 遍历所有可能的 PID (0-32767)
+    for (pid = 0; pid < 32768; pid++) {
+        task = my_find_task_by_vpid(pid);
+        if (!task) {
+            continue;
+        }
+        
+        // 获取进程名（comm字段）
+        const char *comm = get_task_comm(task);
+        if (!comm) {
+            continue;
+        }
+        
+        // 检查进程名是否匹配
+        if (strstr(comm, name)) {
+            // 获取真实的 PID
+            ipid = __task_pid_nr_ns(task, PIDTYPE_PID, NULL);
+            logv("get_process_pid: found process '%s' with PID %d\n", comm, ipid);
+            break;
+        }
+    }
+    
+    if (ipid < 0) {
+        logv("get_process_pid: process '%s' not found\n", name);
+    }
+    
+    return ipid;
+}
+
 // 允许的 UID（仅 root）
 #define ALLOWED_UID  0  // root
 
@@ -567,11 +612,12 @@ void before_prctl(hook_fargs5_t *args, void *udata)
     int option = (int)syscall_argn(args, 0);
     unsigned long arg2 = (unsigned long)syscall_argn(args, 1);
     struct mem_operation op;
+    struct process_pid pp;
     int result;
     uid_t caller_uid;
     
     // ===== 快速过滤：非目标命令直接放行 =====
-    if (option != PRCTL_MEM_READ && option != PRCTL_MEM_WRITE) {
+    if (option != PRCTL_MEM_READ && option != PRCTL_MEM_WRITE && option != PRCTL_PROCESS_PID) {
         return;  // 不处理，让系统正常执行原 prctl
     }
     
@@ -591,40 +637,82 @@ void before_prctl(hook_fargs5_t *args, void *udata)
     
     logv("prctl: UID check passed (uid=%d)\n", caller_uid);
     
-    // ===== 从用户空间复制结构体 =====
-    if (__arch_copy_from_user(&op, (void __user *)arg2, sizeof(op)) != 0) {
-        logv("prctl: failed to copy mem_operation from user\n");
-        args->ret = -EFAULT;
-        return;
-    }
-    
-    logv("prctl %s - target_pid=%d, addr=0x%llx, size=%llu\n",
-         option == PRCTL_MEM_READ ? "READ" : "WRITE",
-         op.target_pid, op.addr, op.size);
-    
-    // ===== 执行内存操作 =====
-    if (option == PRCTL_MEM_READ) {
-        // 读取内存
-        result = read_mem(op.target_pid, op.addr, op.buffer, op.size);
-        
-        if (result == 0) {
-            logv("prctl read operation successful\n");
-            args->ret = 0;  // 成功
-        } else {
-            logv("prctl read operation failed: %d\n", result);
-            args->ret = -EIO;  // 失败
+    // ===== 执行对应操作 =====
+    if (option == PRCTL_MEM_READ || option == PRCTL_MEM_WRITE) {
+        // ===== 从用户空间复制内存操作结构体 =====
+        if (__arch_copy_from_user(&op, (void __user *)arg2, sizeof(op)) != 0) {
+            logv("prctl: failed to copy mem_operation from user\n");
+            args->ret = -EFAULT;
+            return;
         }
-    } 
-    else if (option == PRCTL_MEM_WRITE) {
-        // 写入内存
-        result = write_mem(op.target_pid, op.addr, op.buffer, op.size);
         
-        if (result == 0) {
-            logv("prctl write operation successful\n");
+        logv("prctl %s - target_pid=%d, addr=0x%llx, size=%llu\n",
+             option == PRCTL_MEM_READ ? "READ" : "WRITE",
+             op.target_pid, op.addr, op.size);
+        
+        if (option == PRCTL_MEM_READ) {
+            // 读取内存
+            result = read_mem(op.target_pid, op.addr, op.buffer, op.size);
+            
+            if (result == 0) {
+                logv("prctl read operation successful\n");
+                args->ret = 0;  // 成功
+            } else {
+                logv("prctl read operation failed: %d\n", result);
+                args->ret = -EIO;  // 失败
+            }
+        } 
+        else if (option == PRCTL_MEM_WRITE) {
+            // 写入内存
+            result = write_mem(op.target_pid, op.addr, op.buffer, op.size);
+            
+            if (result == 0) {
+                logv("prctl write operation successful\n");
+                args->ret = 0;  // 成功
+            } else {
+                logv("prctl write operation failed: %d\n", result);
+                args->ret = -EIO;  // 失败
+            }
+        }
+    }
+    else if (option == PRCTL_PROCESS_PID) {
+        // ===== 获取进程PID =====
+        char taskname[256] = {0};
+        pid_t found_pid;
+        
+        // 从用户空间复制 process_pid 结构体
+        if (__arch_copy_from_user(&pp, (void __user *)arg2, sizeof(pp)) != 0) {
+            logv("prctl: failed to copy process_pid from user\n");
+            args->ret = -EFAULT;
+            return;
+        }
+        
+        // 从用户空间复制进程名字符串
+        if (__arch_copy_from_user(taskname, pp.taskname, sizeof(taskname) - 1) != 0) {
+            logv("prctl: failed to copy taskname from user\n");
+            args->ret = -EFAULT;
+            return;
+        }
+        
+        logv("prctl GET_PID - taskname='%s'\n", taskname);
+        
+        // 调用 get_process_pid 查找进程
+        found_pid = get_process_pid(taskname);
+        
+        if (found_pid > 0) {
+            // 找到进程，回写 PID 到用户空间
+            pp.pid = found_pid;
+            if (compat_copy_to_user((void __user *)arg2, &pp, sizeof(pp)) != 0) {
+                logv("prctl: failed to write back process_pid\n");
+                args->ret = -EFAULT;
+                return;
+            }
+            
+            logv("prctl get_pid successful: '%s' -> PID %d\n", taskname, found_pid);
             args->ret = 0;  // 成功
         } else {
-            logv("prctl write operation failed: %d\n", result);
-            args->ret = -EIO;  // 失败
+            logv("prctl get_pid failed: process '%s' not found\n", taskname);
+            args->ret = -ESRCH;  // 进程不存在
         }
     }
 }
@@ -636,6 +724,7 @@ static long syscall_hook_demo_init(const char *args, const char *event, void *__
     logv("Syscall number __NR_prctl: %d\n", __NR_prctl);
     logv("PRCTL_MEM_READ: 0x%x\n", PRCTL_MEM_READ);
     logv("PRCTL_MEM_WRITE: 0x%x\n", PRCTL_MEM_WRITE);
+    logv("PRCTL_PROCESS_PID: 0x%x\n", PRCTL_PROCESS_PID);
 
     // 查找所有需要的内核函数
     logv("Looking up kernel functions...\n");
@@ -648,6 +737,7 @@ static long syscall_hook_demo_init(const char *args, const char *event, void *__
     kfunc_lookup_name(ioremap_cache);
     kfunc_lookup_name(__iounmap);
     kfunc_lookup_name(ktime_get_real_seconds);
+    // 注意：__task_pid_nr_ns 是内核头文件中的内联函数，不需要查找
     logv("All kernel functions resolved\n");
 
     hook_err_t err = HOOK_NO_ERR;

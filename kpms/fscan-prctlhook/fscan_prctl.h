@@ -31,15 +31,27 @@ struct mem_operation {
     uint64_t size;         // 读写大小
 };
 
+// 进程PID查询结构体
+struct process_pid {
+#ifdef __KERNEL__
+    char __user *taskname; // 内核空间：用户空间字符串指针
+#else
+    char *taskname;        // 用户空间：进程名字符串
+#endif
+    pid_t pid;             // 返回的进程 PID（内核回写）
+};
+
 // prctl 命令定义
 // 使用不常见的 option 值，伪装成自定义进程控制
 // "MEM" 的 ASCII 码 + 操作类型
-#define PRCTL_MEM_READ   0x4D454D01  // "MEM\x01" 
-#define PRCTL_MEM_WRITE  0x4D454D02  // "MEM\x02"
+#define PRCTL_MEM_READ      0x4D454D01  // "MEM\x01" 
+#define PRCTL_MEM_WRITE     0x4D454D02  // "MEM\x02"
+#define PRCTL_PROCESS_PID   0x4D454D03  // "MEM\x03" - 获取进程PID
 
 // 为了兼容性，也可以使用这些别名
 #define OP_READ_MEM      PRCTL_MEM_READ
 #define OP_WRITE_MEM     PRCTL_MEM_WRITE
+#define OP_GET_PID       PRCTL_PROCESS_PID
 
 // 命令码说明:
 // 0x4D454D01 = 1297239809 (十进制)
