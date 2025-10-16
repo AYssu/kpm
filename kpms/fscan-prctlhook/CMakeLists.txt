@@ -50,6 +50,45 @@ endif()
 message(STATUS "KP_DIR: ${KP_DIR}")
 
 # ============================
+# 自动版本号生成
+# ============================
+
+# 主版本和次版本
+set(VERSION_MAJOR 1)
+set(VERSION_MINOR 3)
+
+# 构建号策略1：基于当前时间的紧凑格式 (DDHHMM - 6位数字)
+# 这样版本号格式为: 1.3.DDHHMM (最多10字符，符合12字符限制)
+string(TIMESTAMP BUILD_NUMBER "%d%H%M")
+
+# 构建号策略2：如果需要更简洁，可以使用计数器
+# 读取或创建 build_number.txt 文件
+set(BUILD_NUMBER_FILE "${CMAKE_CURRENT_SOURCE_DIR}/.build_number")
+if(EXISTS "${BUILD_NUMBER_FILE}")
+    file(READ "${BUILD_NUMBER_FILE}" OLD_BUILD_COUNT)
+    string(STRIP "${OLD_BUILD_COUNT}" OLD_BUILD_COUNT)
+    if(OLD_BUILD_COUNT MATCHES "^[0-9]+$")
+        math(EXPR BUILD_COUNT "${OLD_BUILD_COUNT} + 1")
+    else()
+        set(BUILD_COUNT 1)
+    endif()
+else()
+    set(BUILD_COUNT 1)
+endif()
+file(WRITE "${BUILD_NUMBER_FILE}" "${BUILD_COUNT}")
+
+# 选择构建号：可以切换为 BUILD_COUNT 使用递增计数器
+# set(BUILD_NUMBER ${BUILD_COUNT})
+
+# 完整版本号 (格式: 1.3.DDHHMM 或 1.3.BUILD_COUNT)
+set(KPM_BUILD_VERSION "${VERSION_MAJOR}.${VERSION_MINOR}.${BUILD_NUMBER}")
+
+# 将版本号传递给编译器
+add_definitions(-DKPM_BUILD_VERSION="${KPM_BUILD_VERSION}")
+
+message(STATUS "Build Version: ${KPM_BUILD_VERSION} (Build #${BUILD_COUNT})")
+
+# ============================
 # 编译标志
 # ============================
 

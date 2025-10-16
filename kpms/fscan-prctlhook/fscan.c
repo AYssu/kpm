@@ -6,7 +6,6 @@
  #include <compiler.h>
  #include <kpmodule.h>
  #include <linux/printk.h>
- #include <uapi/asm-generic/unistd.h>
  #include <linux/uaccess.h>
  #include <syscall.h>
  #include <linux/string.h>
@@ -18,17 +17,18 @@
  #include <linux/pid.h>
  #include <linux/sched.h>
  #include <linux/mm_types.h>
- #include <linux/errno.h>
  #include <linux/cred.h>
  #include <linux/llist.h>
- #include <linux/rcupdate.h>
-//  #include <limits.h>
  #include "obfuscate.h"
- KPM_NAME("FastScan");
- KPM_VERSION("1.3.101");
- KPM_LICENSE("GPL v2");
- KPM_AUTHOR("AYssu");
- KPM_DESCRIPTION("FastScan专用内存读取模块?");
+
+KPM_NAME("FastScan");
+#ifndef KPM_BUILD_VERSION
+#define KPM_BUILD_VERSION "2.0.0"
+#endif
+KPM_VERSION(KPM_BUILD_VERSION);
+KPM_LICENSE("GPL v2");
+KPM_AUTHOR("AYssu");
+KPM_DESCRIPTION("FastScan专用内存读取模块?");
 
 // ======================== 日志控制开关 ========================
 // 定义 ENABLE_DEBUG_LOG 为 1 启用日志，为 0 禁用日志

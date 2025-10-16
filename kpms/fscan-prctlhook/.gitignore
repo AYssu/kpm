@@ -19,3 +19,4 @@
 *.kpm
 /build
 /cmake-build-debug
+.build_number
