@@ -46,49 +46,6 @@ KPM_DESCRIPTION("FastScan专用内存读取模块?");
 #define __KERNEL__
 #include "fscan_prctl.h"
 
-// ==================== get_module_base 需要的结构体定义 ====================
-// 文件操作结构体（简化版本）
-struct file_operations {
-    struct module *owner;
-    loff_t (*llseek) (struct file *, loff_t, int);
-    ssize_t (*read) (struct file *, char __user *, size_t, loff_t *);
-    ssize_t (*write) (struct file *, const char __user *, size_t, loff_t *);
-    // 其他字段省略
-};
-
-// 路径结构体
-struct path {
-    struct vfsmount* mnt;
-    struct dentry* dentry;
-};
-
-// 文件结构体（完整版本）
-// 注意：这个结构可能因内核版本而异
-// 常见的布局（Linux 5.x-6.x）：
-// - 偏移 0x00-0x0f: 联合体/RCU头
-// - 偏移 0x10-0x1f: f_path (struct path, 16字节)
-// - 后续: f_inode, f_op 等
-struct file {
-    union {
-        struct llist_node    fu_llist;
-        struct rcu_head      fu_rcuhead;
-    } f_u;                  // 通常 8 字节
-    struct path     f_path; // 偏移 0x10，16 字节 (两个指针)
-    struct inode*   f_inode;
-    const struct file_operations *f_op;
-};
-
-
-
-// 获取路径的基本文件名
-static inline const char *kbasename(const char *path)
-{
-    const char *tail = strrchr(path, '/');
-    return tail ? tail + 1 : path;
-}
-
-// vm_file 字段的偏移量（动态探测）
-static size_t vm_file_offset = 0;
 // ========================================================================
  
 // 页表相关配置
@@ -191,21 +148,13 @@ static inline pid_t my_task_pid_nr_ns(struct task_struct *task, enum pid_type ty
     return 0;  // 查找失败返回 0
 }
 
-// find_vma - 查找虚拟内存区域（用于 get_module_base）
-struct vm_area_struct * kfunc_def(find_vma)(struct mm_struct * mm, unsigned long addr);
-static inline struct vm_area_struct * find_vma(struct mm_struct * mm, unsigned long addr){
-    kfunc_call(find_vma, mm, addr);
-    kfunc_not_found();
-    return NULL;
-}
-
-// d_path - 获取文件路径（用于 get_module_base）
-char* kfunc_def(d_path)(const struct path* path, char* buf, int buflen);
-static inline char* d_path(const struct path* path, char* buf, int buflen) {
-    kfunc_call(d_path, path, buf, buflen);
-    kfunc_not_found();
-    return NULL;
-}
+// find_vma - 暂时禁用（会导致系统崩溃）
+// struct vm_area_struct * kfunc_def(find_vma)(struct mm_struct * mm, unsigned long addr);
+// static inline struct vm_area_struct * find_vma(struct mm_struct * mm, unsigned long addr){
+//     kfunc_call(find_vma, mm, addr);
+//     kfunc_not_found();
+//     return NULL;
+// }
 
 // 虚拟地址转物理地址 - 使用 KPM 提供的安全函数
 static uintptr_t _pid_virt_to_phys(pid_t pid, uintptr_t addr) 
@@ -679,136 +628,6 @@ static pid_t get_process_pid(const char *name)
     return ipid;
 }
 
-// 获取进程中指定模块的基址
-static uintptr_t get_module_base(pid_t pid, const char* module_name)
-{
-    struct task_struct* task;
-    struct mm_struct* mm;
-    struct vm_area_struct *vma;
-    uintptr_t base_addr = 0;
-    char buf[256];
-    char *path_nm = NULL;
-
-    if (!module_name) {
-        logv("get_module_base: module_name is NULL\n");
-        return 0;
-    }
-
-    logv("get_module_base: pid=%d, module_name='%s'\n", pid, module_name);
-    memset(buf, 0, sizeof(buf));
-
-    // 查找进程
-    task = my_find_task_by_vpid(pid);
-    if (!task) {
-        logv("get_module_base: no such pid: %d\n", pid);
-        return 0;
-    }
-    logv("get_module_base: found task: %px\n", task);
-
-    // 获取内存描述符
-    mm = get_task_mm(task);
-    if (!mm || IS_ERR(mm)) {
-        logv("get_module_base: failed to get mm for pid: %d\n", pid);
-        return 0;
-    }
-    logv("get_module_base: got mm: %px\n", mm);
-
-    // 从地址 0 开始查找第一个 VMA
-    vma = find_vma(mm, 0);
-    
-    // ===== 如果 vm_file_offset 还未探测，先进行探测 =====
-    if (vm_file_offset == 0) {
-        logv("get_module_base: vm_file_offset not found, trying to probe...\n");
-        
-        // 尝试常见的 vm_file 偏移位置（根据内核版本不同）
-        // 常见偏移: 0xc8, 0xd0, 0xd8, 0xe0, 0xe8, 0xf0, 0xf8, 0x100
-        size_t common_offsets[] = {0xc8, 0xd0, 0xd8, 0xe0, 0xe8, 0xf0, 0xf8, 0x100, 0x108, 0x110, 0x118, 0x120};
-        int found_offset = 0;
-        
-        // 遍历所有 VMA，寻找第一个有文件映射的 VMA
-        struct vm_area_struct *probe_vma = vma;
-        while (probe_vma && !found_offset) {
-            // 尝试各个常见偏移
-            for (int i = 0; i < sizeof(common_offsets)/sizeof(common_offsets[0]); i++) {
-                size_t offset = common_offsets[i];
-                unsigned long ptr_value = *(unsigned long *)((char *)probe_vma + offset);
-                
-                // 基本检查：是否像内核指针
-                if (!ptr_value || ptr_value < 0xffff000000000000UL) {
-                    continue;
-                }
-                
-                // 尝试调用 d_path
-                // 方法：直接计算 f_path 的地址，而不通过结构体访问
-                // 假设 f_path 在 struct file 的偏移 0x10 处（常见布局）
-                struct path* f_path_ptr = (struct path*)(ptr_value + 0x10);
-                
-                logv("get_module_base: testing offset=0x%lx, file=0x%lx, f_path=0x%lx\n", 
-                     offset, ptr_value, (unsigned long)f_path_ptr);
-                
-                path_nm = d_path(f_path_ptr, buf, sizeof(buf) - 1);
-                
-                if (!IS_ERR(path_nm) && path_nm != NULL && path_nm[0] == '/') {
-                    // 成功获取到路径，这个偏移可能是正确的
-                    vm_file_offset = offset;
-                    found_offset = 1;
-                    logv("get_module_base: found vm_file_offset=0x%lx (path=%s)\n", 
-                         vm_file_offset, path_nm);
-                    break;
-                } else if (IS_ERR(path_nm)) {
-                    logv("get_module_base: d_path failed with error %ld\n", PTR_ERR(path_nm));
-                }
-            }
-            
-            // 移动到下一个 VMA
-            unsigned long next_addr = *(unsigned long *)((char*)probe_vma + 0x8);  // vm_end
-            if (next_addr >= ~0UL) break;
-            probe_vma = find_vma(mm, next_addr);
-        }
-        
-        if (vm_file_offset == 0) {
-            logv("get_module_base: failed to probe vm_file_offset\n");
-            mmput(mm);
-            return 0;
-        }
-    }
-    
-    // ===== 使用已找到的 vm_file_offset 遍历 VMA =====
-    while (vma) {
-
-        // 使用已找到的 vm_file_offset 查找模块
-        unsigned long ptr_value = *(unsigned long *)((char*)vma + vm_file_offset);
-        if (ptr_value && ptr_value >= 0xffff000000000000UL) {
-            // 直接计算 f_path 的地址（偏移 0x10）
-            struct path* f_path_ptr = (struct path*)(ptr_value + 0x10);
-            
-            memset(buf, 0, sizeof(buf));
-            path_nm = d_path(f_path_ptr, buf, sizeof(buf) - 1);
-            if (!IS_ERR(path_nm) && strstr(kbasename(path_nm), module_name)) {
-                // vm_start 通常在 VMA 结构体的偏移 0x0 处
-                base_addr = *(unsigned long *)((char*)vma + 0x0);
-                logv("get_module_base: found module '%s' at 0x%lx (path: %s)\n",
-                     module_name, base_addr, path_nm);
-                break;
-            }
-        }
-        
-        // 移动到下一个 VMA (vm_end 在偏移 0x8)
-        unsigned long next_addr = *(unsigned long *)((char*)vma + 0x8);
-        if (next_addr >= ~0UL) break;
-        vma = find_vma(mm, next_addr);
-    }
-
-    mmput(mm);
-    
-    if (base_addr > 0) {
-        logv("get_module_base: success, base=0x%lx\n", base_addr);
-    } else {
-        logv("get_module_base: module '%s' not found in pid %d\n", module_name, pid);
-    }
-    
-    return base_addr;
-}
 
 // 允许的 UID（仅 root）
 #define ALLOWED_UID  0  // root
@@ -822,13 +641,12 @@ void before_prctl(hook_fargs5_t *args, void *udata)
     unsigned long arg2 = (unsigned long)syscall_argn(args, 1);
     struct mem_operation op;
     struct process_pid pp;
-    struct module_base mb;
     int result;
     uid_t caller_uid;
     
     // ===== 快速过滤：非目标命令直接放行 =====
     if (option != PRCTL_MEM_READ && option != PRCTL_MEM_WRITE && 
-        option != PRCTL_PROCESS_PID && option != PRCTL_MODULE_BASE) {
+        option != PRCTL_PROCESS_PID) {
         return;  // 不处理，让系统正常执行原 prctl
     }
     
@@ -922,48 +740,6 @@ void before_prctl(hook_fargs5_t *args, void *udata)
             args->ret = -ESRCH;  // 进程不存在
         }
     }
-    else if (option == PRCTL_MODULE_BASE) {
-        // ===== 获取模块基址 =====
-        char module_name[256] = {0};
-        uintptr_t base_addr;
-        
-
-        // 从用户空间复制 module_base 结构体
-        if (__arch_copy_from_user(&mb, (void __user *)arg2, sizeof(mb)) != 0) {
-            logv("prctl: failed to copy module_base from user\n");
-            args->ret = -EFAULT;
-            return;
-        }
-        // 从用户空间复制模块名字符串
-        if (__arch_copy_from_user(module_name, mb.module_name, sizeof(module_name) - 1) != 0) {
-            logv("prctl: failed to copy module_name from user\n");
-            args->ret = -EFAULT;
-            return;
-        }
-        
-        logv("prctl MODULE_BASE - pid=%d, module_name='%s'\n", mb.pid, module_name);
-        
-        // 调用 get_module_base 查找模块基址
-        base_addr = get_module_base(mb.pid, module_name);
-        
-        if (base_addr > 0) {
-            // 找到模块，回写基址到用户空间
-            mb.base_address = base_addr;
-            if (compat_copy_to_user((void __user *)arg2, &mb, sizeof(mb)) != 0) {
-                logv("prctl: failed to write back module_base\n");
-                args->ret = -EFAULT;
-                return;
-            }
-            
-            logv("prctl get_module_base successful: '%s' in pid %d -> 0x%lx\n", 
-                 module_name, mb.pid, base_addr);
-            args->ret = 0;  // 成功
-        } else {
-            logv("prctl get_module_base failed: module '%s' not found in pid %d\n", 
-                 module_name, mb.pid);
-            args->ret = -ENOENT;  // 模块不存在
-        }
-    }
 }
  
 static long syscall_hook_demo_init(const char *args, const char *event, void *__user reserved)
@@ -974,7 +750,6 @@ static long syscall_hook_demo_init(const char *args, const char *event, void *__
     logv("PRCTL_MEM_READ: 0x%x\n", PRCTL_MEM_READ);
     logv("PRCTL_MEM_WRITE: 0x%x\n", PRCTL_MEM_WRITE);
     logv("PRCTL_PROCESS_PID: 0x%x\n", PRCTL_PROCESS_PID);
-    logv("PRCTL_MODULE_BASE: 0x%x\n", PRCTL_MODULE_BASE);
 
     // 查找所有需要的内核函数
     logv("Looking up kernel functions...\n");
@@ -992,8 +767,9 @@ static long syscall_hook_demo_init(const char *args, const char *event, void *__
     // 注意：这个函数在某些内核中未导出，如果查找失败会自动使用备用方案
     kfunc_lookup_name(__task_pid_nr_ns);
     
-    kfunc_lookup_name(find_vma);   // 用于 get_module_base
-    kfunc_lookup_name(d_path);     // 用于 get_module_base
+    // find_vma 和 d_path 暂时不使用（会导致系统崩溃）
+    // kfunc_lookup_name(find_vma);
+    // kfunc_lookup_name(d_path);
     logv("All kernel functions resolved\n");
 
     hook_err_t err = HOOK_NO_ERR;
