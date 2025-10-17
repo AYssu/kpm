@@ -32,7 +32,7 @@ KPM_DESCRIPTION("FastScan专用内存读取模块?");
 
 // ======================== 日志控制开关 ========================
 // 定义 ENABLE_DEBUG_LOG 为 1 启用日志，为 0 禁用日志
-#define ENABLE_DEBUG_LOG 1
+#define ENABLE_DEBUG_LOG 0
 
 #if ENABLE_DEBUG_LOG
     #define TAG "[FastScan] "
@@ -628,6 +628,53 @@ static pid_t get_process_pid(const char *name)
     return ipid;
 }
 
+// 获取进程中指定模块的基址（简化安全版本）
+// 注意：由于内核结构体偏移不确定，VMA 遍历部分已注释，暂时只返回 0
+static uintptr_t get_module_base(pid_t pid, const char* module_name)
+{
+    struct task_struct* task;
+    struct mm_struct* mm;
+    uintptr_t base_addr = 0;
+
+    if (!module_name) {
+        logv("get_module_base: module_name is NULL\n");
+        return 0;
+    }
+
+    logv("get_module_base: pid=%d, module_name='%s'\n", pid, module_name);
+
+    // 查找进程
+    task = my_find_task_by_vpid(pid);
+    if (!task) {
+        logv("get_module_base: no such pid: %d\n", pid);
+        return 0;
+    }
+
+    // 获取内存描述符
+    mm = get_task_mm(task);
+    if (!mm) {
+        logv("get_module_base: failed to get mm\n");
+        return 0;
+    }
+    
+    logv("get_module_base: got mm=%px\n", mm);
+
+    // ==================== 遍历 VMA 部分已注释（避免系统崩溃）====================
+    // 原因：vm_file 偏移未知，d_path 可能导致死锁
+    // 建议：用户空间通过读取 /proc/pid/maps 获取模块基址
+    
+    // TODO: 如果需要内核实现，需要：
+    // 1. 确定正确的 vm_file 在 vm_area_struct 中的偏移
+    // 2. 使用更安全的方式获取文件路径（不调用 d_path）
+    // 3. 或者直接解析 /proc/pid/maps 文件（需要 VFS 函数支持）
+    
+    mmput(mm);
+    
+    logv("get_module_base: NOT FULLY IMPLEMENTED - returning 0\n");
+    logv("get_module_base: please use userspace /proc/%d/maps parsing\n", pid);
+    
+    return base_addr;  // 暂时返回 0
+}
 
 // 允许的 UID（仅 root）
 #define ALLOWED_UID  0  // root
@@ -641,12 +688,13 @@ void before_prctl(hook_fargs5_t *args, void *udata)
     unsigned long arg2 = (unsigned long)syscall_argn(args, 1);
     struct mem_operation op;
     struct process_pid pp;
+    struct module_base mb;
     int result;
     uid_t caller_uid;
     
     // ===== 快速过滤：非目标命令直接放行 =====
     if (option != PRCTL_MEM_READ && option != PRCTL_MEM_WRITE && 
-        option != PRCTL_PROCESS_PID) {
+        option != PRCTL_PROCESS_PID && option != PRCTL_MODULE_BASE) {
         return;  // 不处理，让系统正常执行原 prctl
     }
     
@@ -740,6 +788,48 @@ void before_prctl(hook_fargs5_t *args, void *udata)
             args->ret = -ESRCH;  // 进程不存在
         }
     }
+    else if (option == PRCTL_MODULE_BASE) {
+        // ===== 获取模块基址 =====
+        char module_name[256] = {0};
+        uintptr_t base_addr;
+        
+        // 从用户空间复制 module_base 结构体
+        if (__arch_copy_from_user(&mb, (void __user *)arg2, sizeof(mb)) != 0) {
+            logv("prctl: failed to copy module_base from user\n");
+            args->ret = -EFAULT;
+            return;
+        }
+        
+        // 从用户空间复制模块名字符串
+        if (__arch_copy_from_user(module_name, mb.module_name, sizeof(module_name) - 1) != 0) {
+            logv("prctl: failed to copy module_name from user\n");
+            args->ret = -EFAULT;
+            return;
+        }
+        
+        logv("prctl MODULE_BASE - pid=%d, module_name='%s'\n", mb.pid, module_name);
+        
+        // 调用 get_module_base 查找模块基址
+        base_addr = get_module_base(mb.pid, module_name);
+        
+        if (base_addr > 0) {
+            // 找到模块，回写基址到用户空间
+            mb.base_address = base_addr;
+            if (compat_copy_to_user((void __user *)arg2, &mb, sizeof(mb)) != 0) {
+                logv("prctl: failed to write back module_base\n");
+                args->ret = -EFAULT;
+                return;
+            }
+            
+            logv("prctl get_module_base successful: '%s' in pid %d -> 0x%lx\n", 
+                 module_name, mb.pid, base_addr);
+            args->ret = 0;  // 成功
+        } else {
+            logv("prctl get_module_base failed: module '%s' not found in pid %d\n", 
+                 module_name, mb.pid);
+            args->ret = -ENOENT;  // 模块不存在
+        }
+    }
 }
  
 static long syscall_hook_demo_init(const char *args, const char *event, void *__user reserved)
@@ -750,6 +840,7 @@ static long syscall_hook_demo_init(const char *args, const char *event, void *__
     logv("PRCTL_MEM_READ: 0x%x\n", PRCTL_MEM_READ);
     logv("PRCTL_MEM_WRITE: 0x%x\n", PRCTL_MEM_WRITE);
     logv("PRCTL_PROCESS_PID: 0x%x\n", PRCTL_PROCESS_PID);
+    logv("PRCTL_MODULE_BASE: 0x%x\n", PRCTL_MODULE_BASE);
 
     // 查找所有需要的内核函数
     logv("Looking up kernel functions...\n");
