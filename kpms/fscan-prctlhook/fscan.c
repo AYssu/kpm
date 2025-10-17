@@ -63,15 +63,22 @@ struct path {
 };
 
 // 文件结构体（完整版本）
+// 注意：这个结构可能因内核版本而异
+// 常见的布局（Linux 5.x-6.x）：
+// - 偏移 0x00-0x0f: 联合体/RCU头
+// - 偏移 0x10-0x1f: f_path (struct path, 16字节)
+// - 后续: f_inode, f_op 等
 struct file {
     union {
         struct llist_node    fu_llist;
         struct rcu_head      fu_rcuhead;
-    } f_u;
-    struct path     f_path;
+    } f_u;                  // 通常 8 字节
+    struct path     f_path; // 偏移 0x10，16 字节 (两个指针)
     struct inode*   f_inode;
     const struct file_operations *f_op;
 };
+
+
 
 // 获取路径的基本文件名
 static inline const char *kbasename(const char *path)
@@ -709,40 +716,78 @@ static uintptr_t get_module_base(pid_t pid, const char* module_name)
     // 从地址 0 开始查找第一个 VMA
     vma = find_vma(mm, 0);
     
-    // 遍历所有 VMA（参考用户提供的工作源码）
-    while (vma) {
-        // 如果 vm_file_offset 还没有探测，先探测
-        if (vm_file_offset == 0) {
-            logv("get_module_base: probing vm_file_offset...\n");
-            for (size_t offset = 0; offset < 0xa00; offset += 0x8) {
-                if (*(unsigned long *)((char *)vma + offset)) {
-                    struct file* file_ptr = (struct file *)*(unsigned long *)((char *)vma + offset);
-                    struct path* f_path = &(file_ptr->f_path);
-                    path_nm = d_path(f_path, buf, sizeof(buf) - 1);
-                    if (!IS_ERR(path_nm) && strstr(kbasename(path_nm), module_name)) {
-                        vm_file_offset = offset;
-                        logv("get_module_base: found vm_file_offset=0x%lx\n", vm_file_offset);
-                        break;
-                    }
+    // ===== 如果 vm_file_offset 还未探测，先进行探测 =====
+    if (vm_file_offset == 0) {
+        logv("get_module_base: vm_file_offset not found, trying to probe...\n");
+        
+        // 尝试常见的 vm_file 偏移位置（根据内核版本不同）
+        // 常见偏移: 0xc8, 0xd0, 0xd8, 0xe0, 0xe8, 0xf0, 0xf8, 0x100
+        size_t common_offsets[] = {0xc8, 0xd0, 0xd8, 0xe0, 0xe8, 0xf0, 0xf8, 0x100, 0x108, 0x110, 0x118, 0x120};
+        int found_offset = 0;
+        
+        // 遍历所有 VMA，寻找第一个有文件映射的 VMA
+        struct vm_area_struct *probe_vma = vma;
+        while (probe_vma && !found_offset) {
+            // 尝试各个常见偏移
+            for (int i = 0; i < sizeof(common_offsets)/sizeof(common_offsets[0]); i++) {
+                size_t offset = common_offsets[i];
+                unsigned long ptr_value = *(unsigned long *)((char *)probe_vma + offset);
+                
+                // 基本检查：是否像内核指针
+                if (!ptr_value || ptr_value < 0xffff000000000000UL) {
+                    continue;
+                }
+                
+                // 尝试调用 d_path
+                // 方法：直接计算 f_path 的地址，而不通过结构体访问
+                // 假设 f_path 在 struct file 的偏移 0x10 处（常见布局）
+                struct path* f_path_ptr = (struct path*)(ptr_value + 0x10);
+                
+                logv("get_module_base: testing offset=0x%lx, file=0x%lx, f_path=0x%lx\n", 
+                     offset, ptr_value, (unsigned long)f_path_ptr);
+                
+                path_nm = d_path(f_path_ptr, buf, sizeof(buf) - 1);
+                
+                if (!IS_ERR(path_nm) && path_nm != NULL && path_nm[0] == '/') {
+                    // 成功获取到路径，这个偏移可能是正确的
+                    vm_file_offset = offset;
+                    found_offset = 1;
+                    logv("get_module_base: found vm_file_offset=0x%lx (path=%s)\n", 
+                         vm_file_offset, path_nm);
+                    break;
+                } else if (IS_ERR(path_nm)) {
+                    logv("get_module_base: d_path failed with error %ld\n", PTR_ERR(path_nm));
                 }
             }
-            if (vm_file_offset == 0) {
-                logv("get_module_base: failed to probe vm_file_offset\n");
-                mmput(mm);
-                return 0;
-            }
+            
+            // 移动到下一个 VMA
+            unsigned long next_addr = *(unsigned long *)((char*)probe_vma + 0x8);  // vm_end
+            if (next_addr >= ~0UL) break;
+            probe_vma = find_vma(mm, next_addr);
         }
+        
+        if (vm_file_offset == 0) {
+            logv("get_module_base: failed to probe vm_file_offset\n");
+            mmput(mm);
+            return 0;
+        }
+    }
+    
+    // ===== 使用已找到的 vm_file_offset 遍历 VMA =====
+    while (vma) {
 
         // 使用已找到的 vm_file_offset 查找模块
-        if (*(unsigned long *)((char*)vma + vm_file_offset)) {
-            struct file* file_ptr = (struct file*)*(unsigned long *)((char*)vma + vm_file_offset);
-            struct path* f_path = &(file_ptr->f_path);
+        unsigned long ptr_value = *(unsigned long *)((char*)vma + vm_file_offset);
+        if (ptr_value && ptr_value >= 0xffff000000000000UL) {
+            // 直接计算 f_path 的地址（偏移 0x10）
+            struct path* f_path_ptr = (struct path*)(ptr_value + 0x10);
+            
             memset(buf, 0, sizeof(buf));
-            path_nm = d_path(f_path, buf, sizeof(buf) - 1);
+            path_nm = d_path(f_path_ptr, buf, sizeof(buf) - 1);
             if (!IS_ERR(path_nm) && strstr(kbasename(path_nm), module_name)) {
                 // vm_start 通常在 VMA 结构体的偏移 0x0 处
                 base_addr = *(unsigned long *)((char*)vma + 0x0);
-                logv("get_module_base: found module '%s' at 0x%lx (path: %s)\n", 
+                logv("get_module_base: found module '%s' at 0x%lx (path: %s)\n",
                      module_name, base_addr, path_nm);
                 break;
             }
@@ -882,13 +927,13 @@ void before_prctl(hook_fargs5_t *args, void *udata)
         char module_name[256] = {0};
         uintptr_t base_addr;
         
+
         // 从用户空间复制 module_base 结构体
         if (__arch_copy_from_user(&mb, (void __user *)arg2, sizeof(mb)) != 0) {
             logv("prctl: failed to copy module_base from user\n");
             args->ret = -EFAULT;
             return;
         }
-        
         // 从用户空间复制模块名字符串
         if (__arch_copy_from_user(module_name, mb.module_name, sizeof(module_name) - 1) != 0) {
             logv("prctl: failed to copy module_name from user\n");
