@@ -17,9 +17,15 @@
  #include <linux/pid.h>
  #include <linux/sched.h>
  #include <linux/mm_types.h>
+ #include <linux/mm.h>
+ #include <linux/preempt.h>
  #include <linux/cred.h>
  #include <linux/llist.h>
  #include "obfuscate.h"
+
+ #ifndef cond_resched
+ #define cond_resched() do { } while (0)
+ #endif
 
 KPM_NAME("FastScan");
 #ifndef KPM_BUILD_VERSION
@@ -148,13 +154,6 @@ static inline pid_t my_task_pid_nr_ns(struct task_struct *task, enum pid_type ty
     return 0;  // 查找失败返回 0
 }
 
-// find_vma - 暂时禁用（会导致系统崩溃）
-// struct vm_area_struct * kfunc_def(find_vma)(struct mm_struct * mm, unsigned long addr);
-// static inline struct vm_area_struct * find_vma(struct mm_struct * mm, unsigned long addr){
-//     kfunc_call(find_vma, mm, addr);
-//     kfunc_not_found();
-//     return NULL;
-// }
 
 // 虚拟地址转物理地址 - 优化版本（使用已获取的 mm_struct）
 // 修复：避免每次都调用 get_task_mm/mmput，减少内核开销和潜在的内存泄漏
@@ -205,8 +204,11 @@ static uintptr_t _virt_to_phys_with_mm(struct mm_struct *mm, uintptr_t addr)
         return 0;
     }
     
-    // 计算物理地址
-    page_addr = pte_pfn(*pte) << PAGE_SHIFT;
+    // 计算物理地址（使用运行时物理地址位宽，避免固定 PHYS_MASK 带来的错误）
+    {
+        uint64_t dyn_mask = ((1ULL << phys_addr_size1) - 1ULL) & PAGE_MASK;
+        page_addr = (phys_addr_t)(pte_value & dyn_mask);
+    }
     page_offset = addr & (PAGE_SIZE - 1);
     phys_addr = page_addr + page_offset;
     
@@ -260,15 +262,10 @@ static size_t read_physical_address(phys_addr_t pa, void __user *buffer, size_t 
         size = PAGE_SIZE - offset;
     }
     
-    // 如果是正常 RAM 页，直接通过内核线性映射读取，更隐蔽也更高效
-    if (pfn_valid(__phys_to_pfn(page_pa))) {
-        const char *kva = (const char *)__va(page_pa) + offset;
-        if (compat_copy_to_user(buffer, kva, size) != 0) {
-            logv("Failed to copy to user (__va path)\n");
-            return 0;
-        }
-        logv("Read via __va: pa=0x%llx, offset=0x%lx, size=%zu\n", page_pa, offset, size);
-        return size;
+    // 验证物理地址
+    if (!pfn_valid(__phys_to_pfn(pa))) {
+        logv("Invalid PFN for pa=0x%llx\n", pa);
+        return 0;
     }
     
     // ===== 查找缓存 =====
@@ -364,15 +361,10 @@ static size_t write_physical_address(phys_addr_t pa, const void __user *buffer, 
         size = PAGE_SIZE - offset;
     }
     
-    // 如果是正常 RAM 页，直接通过内核线性映射写入
-    if (pfn_valid(__phys_to_pfn(page_pa))) {
-        char *kva = (char *)__va(page_pa) + offset;
-        if (__arch_copy_from_user(kva, buffer, size) != 0) {
-            logv("Failed to copy from user (__va path)\n");
-            return 0;
-        }
-        logv("Write via __va: pa=0x%llx, offset=0x%lx, size=%zu\n", page_pa, offset, size);
-        return size;
+    // 验证物理地址
+    if (!pfn_valid(__phys_to_pfn(pa))) {
+        logv("Write: Invalid PFN for pa=0x%llx\n", pa);
+        return 0;
     }
     
     // ===== 查找缓存 =====
@@ -457,8 +449,9 @@ static int read_mem(pid_t pid, uintptr_t addr, void __user *buffer, size_t size)
     size_t total_read = 0;
     size_t bytes_read;
     uintptr_t current_addr = addr;
-    void __user *current_buffer = buffer;
+    u8 __user *current_buffer = (u8 __user *)buffer;
     size_t remaining = size;
+    unsigned int iter = 0;
     
     logv("read_mem: pid=%d, addr=0x%lx, size=%zu\n", pid, addr, size);
     
@@ -527,6 +520,9 @@ static int read_mem(pid_t pid, uintptr_t addr, void __user *buffer, size_t size)
         remaining -= max;
         current_addr += max;
         current_buffer += max;
+        if ((++iter & 0x3F) == 0) {
+            cond_resched();
+        }
     }
     
     // 释放 mm 引用（只需要一次，重要优化点！）
@@ -555,7 +551,7 @@ static int write_mem(pid_t pid, uintptr_t addr, const void __user *buffer, size_
     size_t total_written = 0;
     size_t bytes_written;
     uintptr_t current_addr = addr;
-    const void __user *current_buffer = buffer;
+    const u8 __user *current_buffer = (const u8 __user *)buffer;
     size_t remaining = size;
     
     logv("write_mem: pid=%d, addr=0x%lx, size=%zu\n", pid, addr, size);
