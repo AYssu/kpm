@@ -8,7 +8,7 @@
 #define _OBFUSCATE_H
 
 // 核心功能函数混淆
-#define _pid_virt_to_phys       __x7a2fb9c
+#define _virt_to_phys_with_mm       __x7a2fb9c
 #define read_physical_address   __m3e9d1f7
 #define read_mem                __k5n1q8p2
 #define before_prctl            __AYssu520

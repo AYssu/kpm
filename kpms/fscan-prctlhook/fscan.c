@@ -156,87 +156,59 @@ static inline pid_t my_task_pid_nr_ns(struct task_struct *task, enum pid_type ty
 //     return NULL;
 // }
 
-// 虚拟地址转物理地址 - 使用 KPM 提供的安全函数
-static uintptr_t _pid_virt_to_phys(pid_t pid, uintptr_t addr) 
+// 虚拟地址转物理地址 - 优化版本（使用已获取的 mm_struct）
+// 修复：避免每次都调用 get_task_mm/mmput，减少内核开销和潜在的内存泄漏
+static uintptr_t _virt_to_phys_with_mm(struct mm_struct *mm, uintptr_t addr) 
 {
+    uint64_t* pte_ptr;
+    pte_t* pte;
+    uint64_t pte_value;
+    phys_addr_t page_addr;
+    uintptr_t page_offset;
+    phys_addr_t phys_addr;
+    uintptr_t pgd_base;
+    
     if (mm_struct_offset.pgd_offset < 0) {
         logv("mm_struct_offset.pgd_offset not initialized\n");
         return 0;
     }
     
-    // 获取页表配置
-    uint64_t tcr_el1;
-    asm volatile("mrs %0, tcr_el1" : "=r"(tcr_el1));
-    uint64_t tg1 = tcr_el1 << 32 >> 62;
-    uint64_t t1sz = (tcr_el1 >> 16) & 0x1F;
-    uint64_t ips = (tcr_el1 >> 30) & 0x3;
-    
-    page_offset1 = (1ULL << (64 - t1sz));
-    phys_addr_size1 = 32 + (8 * ips);
-    page_shift = 12;
-    
-    if (tg1 == 1) {
-        page_shift = 14;
-        phys_addr_size1 = 40;
-    } else if (tg1 == 3) {
-        page_shift = 16;
-        phys_addr_size1 = 42;
-    }
-    
-    page_size = 1 << page_shift;
-    
-    logv("virt_to_phys: pid=%d, addr=0x%lx\n", pid, addr);
-    
-    // 查找进程
-    struct task_struct *task = my_find_task_by_vpid(pid);
-    if (!task) {
-        logv("No such pid: %d\n", pid);
-        return 0;
-    }
-
-    // 获取内存描述符
-    struct mm_struct *mm = get_task_mm(task);
     if (!mm || IS_ERR(mm)) {
-        logv("Failed to get mm for pid: %d\n", pid);
+        logv("Invalid mm_struct\n");
         return 0;
     }
     
     // 获取页表基址
-    uintptr_t pgd_base = *(uintptr_t *)((uintptr_t)mm + mm_struct_offset.pgd_offset);
+    pgd_base = *(uintptr_t *)((uintptr_t)mm + mm_struct_offset.pgd_offset);
     logv("pgd_base: 0x%lx\n", pgd_base);
     
     // 使用 KPM 提供的安全页表遍历函数
-    uint64_t* pte_ptr = pgtable_entry(pgd_base, addr);
+    pte_ptr = pgtable_entry(pgd_base, addr);
     if (!pte_ptr) {
-        mmput(mm);
         logv("Address 0x%lx not mapped (pgtable_entry returned NULL)\n", addr);
         return 0;
     }
     
-    pte_t* pte = (pte_t*)pte_ptr;
-    uint64_t pte_value = pte_val(*pte);
+    pte = (pte_t*)pte_ptr;
+    pte_value = pte_val(*pte);
     logv("pte_value: 0x%llx\n", pte_value);
     
     // 检查 PTE 是否有效
     if (!pte_value) {
-        mmput(mm);
         logv("PTE is zero\n");
         return 0;
     }
     
     // 检查 present bit
     if (!(pte_value & 1)) {
-        mmput(mm);
         logv("PTE not present (bit 0 not set)\n");
         return 0;
     }
     
     // 计算物理地址
-    phys_addr_t page_addr = pte_pfn(*pte) << PAGE_SHIFT;
-    uintptr_t page_offset = addr & (PAGE_SIZE - 1);
-    phys_addr_t phys_addr = page_addr + page_offset;
-    
-    mmput(mm);
+    page_addr = pte_pfn(*pte) << PAGE_SHIFT;
+    page_offset = addr & (PAGE_SIZE - 1);
+    phys_addr = page_addr + page_offset;
     
     logv("virt: 0x%lx -> phys: 0x%lx (page: 0x%llx, offset: 0x%lx)\n", 
          addr, phys_addr, page_addr, page_offset);
@@ -464,9 +436,12 @@ static size_t write_physical_address(phys_addr_t pa, const void __user *buffer, 
     return size;
 }
 
-// 核心读取函数 - 分页读取，避免跨页问题
+// 核心读取函数 - 优化版本，只获取一次 mm_struct
+// 修复：避免每个页面都调用 get_task_mm/mmput，大幅减少内核开销
 static int read_mem(pid_t pid, uintptr_t addr, void __user *buffer, size_t size)
 {
+    struct task_struct *task;
+    struct mm_struct *mm;
     phys_addr_t pa;
     size_t max;
     size_t total_read = 0;
@@ -476,6 +451,41 @@ static int read_mem(pid_t pid, uintptr_t addr, void __user *buffer, size_t size)
     size_t remaining = size;
     
     logv("read_mem: pid=%d, addr=0x%lx, size=%zu\n", pid, addr, size);
+    
+    // 初始化页表配置（只需要一次）
+    uint64_t tcr_el1;
+    asm volatile("mrs %0, tcr_el1" : "=r"(tcr_el1));
+    uint64_t tg1 = tcr_el1 << 32 >> 62;
+    uint64_t t1sz = (tcr_el1 >> 16) & 0x1F;
+    uint64_t ips = (tcr_el1 >> 30) & 0x3;
+    
+    page_offset1 = (1ULL << (64 - t1sz));
+    phys_addr_size1 = 32 + (8 * ips);
+    page_shift = 12;
+    
+    if (tg1 == 1) {
+        page_shift = 14;
+        phys_addr_size1 = 40;
+    } else if (tg1 == 3) {
+        page_shift = 16;
+        phys_addr_size1 = 42;
+    }
+    
+    page_size = 1 << page_shift;
+    
+    // 查找进程（只需要一次）
+    task = my_find_task_by_vpid(pid);
+    if (!task) {
+        logv("No such pid: %d\n", pid);
+        return -1;
+    }
+    
+    // 获取内存描述符（只需要一次，重要优化点！）
+    mm = get_task_mm(task);
+    if (!mm || IS_ERR(mm)) {
+        logv("Failed to get mm for pid: %d\n", pid);
+        return -1;
+    }
     
     // 分页读取，避免跨页问题
     while (remaining > 0) {
@@ -487,8 +497,8 @@ static int read_mem(pid_t pid, uintptr_t addr, void __user *buffer, size_t size)
         
         logv("Reading chunk: addr=0x%lx, size=%zu\n", current_addr, max);
         
-        // 虚拟地址转物理地址
-        pa = _pid_virt_to_phys(pid, current_addr);
+        // 虚拟地址转物理地址（使用已获取的 mm）
+        pa = _virt_to_phys_with_mm(mm, current_addr);
         if (!pa) {
             logv("Virtual to physical translation failed for addr=0x%lx\n", current_addr);
             // 跳过这一部分，继续下一页
@@ -509,6 +519,9 @@ static int read_mem(pid_t pid, uintptr_t addr, void __user *buffer, size_t size)
         current_buffer += max;
     }
     
+    // 释放 mm 引用（只需要一次，重要优化点！）
+    mmput(mm);
+    
     if (total_read == size) {
         logv("Successfully read all %zu bytes\n", size);
         return 0;
@@ -521,9 +534,12 @@ static int read_mem(pid_t pid, uintptr_t addr, void __user *buffer, size_t size)
     }
 }
 
-// 核心写入函数 - 分页写入，避免跨页问题
+// 核心写入函数 - 优化版本，只获取一次 mm_struct
+// 修复：避免每个页面都调用 get_task_mm/mmput，大幅减少内核开销
 static int write_mem(pid_t pid, uintptr_t addr, const void __user *buffer, size_t size)
 {
+    struct task_struct *task;
+    struct mm_struct *mm;
     phys_addr_t pa;
     size_t max;
     size_t total_written = 0;
@@ -533,6 +549,41 @@ static int write_mem(pid_t pid, uintptr_t addr, const void __user *buffer, size_
     size_t remaining = size;
     
     logv("write_mem: pid=%d, addr=0x%lx, size=%zu\n", pid, addr, size);
+    
+    // 初始化页表配置（只需要一次）
+    uint64_t tcr_el1;
+    asm volatile("mrs %0, tcr_el1" : "=r"(tcr_el1));
+    uint64_t tg1 = tcr_el1 << 32 >> 62;
+    uint64_t t1sz = (tcr_el1 >> 16) & 0x1F;
+    uint64_t ips = (tcr_el1 >> 30) & 0x3;
+    
+    page_offset1 = (1ULL << (64 - t1sz));
+    phys_addr_size1 = 32 + (8 * ips);
+    page_shift = 12;
+    
+    if (tg1 == 1) {
+        page_shift = 14;
+        phys_addr_size1 = 40;
+    } else if (tg1 == 3) {
+        page_shift = 16;
+        phys_addr_size1 = 42;
+    }
+    
+    page_size = 1 << page_shift;
+    
+    // 查找进程（只需要一次）
+    task = my_find_task_by_vpid(pid);
+    if (!task) {
+        logv("No such pid: %d\n", pid);
+        return -1;
+    }
+    
+    // 获取内存描述符（只需要一次，重要优化点！）
+    mm = get_task_mm(task);
+    if (!mm || IS_ERR(mm)) {
+        logv("Failed to get mm for pid: %d\n", pid);
+        return -1;
+    }
     
     // 分页写入，避免跨页问题
     while (remaining > 0) {
@@ -544,8 +595,8 @@ static int write_mem(pid_t pid, uintptr_t addr, const void __user *buffer, size_
         
         logv("Writing chunk: addr=0x%lx, size=%zu\n", current_addr, max);
         
-        // 虚拟地址转物理地址
-        pa = _pid_virt_to_phys(pid, current_addr);
+        // 虚拟地址转物理地址（使用已获取的 mm）
+        pa = _virt_to_phys_with_mm(mm, current_addr);
         if (!pa) {
             logv("Virtual to physical translation failed for addr=0x%lx\n", current_addr);
             // 跳过这一部分，继续下一页
@@ -565,6 +616,9 @@ static int write_mem(pid_t pid, uintptr_t addr, const void __user *buffer, size_
         current_addr += max;
         current_buffer += max;
     }
+    
+    // 释放 mm 引用（只需要一次，重要优化点！）
+    mmput(mm);
     
     if (total_written == size) {
         logv("Successfully wrote all %zu bytes\n", size);
