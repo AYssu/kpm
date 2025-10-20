@@ -251,12 +251,6 @@ static size_t read_physical_address(phys_addr_t pa, void __user *buffer, size_t 
     unsigned long offset;
     int i;
     
-    // 验证物理地址
-    if (!pfn_valid(__phys_to_pfn(pa))) {
-        logv("Invalid PFN for pa=0x%llx\n", pa);
-        return 0;
-    }
-    
     // 计算页对齐的物理地址
     page_pa = pa & PAGE_MASK;
     offset = pa & (PAGE_SIZE - 1);
@@ -264,6 +258,17 @@ static size_t read_physical_address(phys_addr_t pa, void __user *buffer, size_t 
     // 确保读取不跨页
     if (offset + size > PAGE_SIZE) {
         size = PAGE_SIZE - offset;
+    }
+    
+    // 如果是正常 RAM 页，直接通过内核线性映射读取，更隐蔽也更高效
+    if (pfn_valid(__phys_to_pfn(page_pa))) {
+        const char *kva = (const char *)__va(page_pa) + offset;
+        if (compat_copy_to_user(buffer, kva, size) != 0) {
+            logv("Failed to copy to user (__va path)\n");
+            return 0;
+        }
+        logv("Read via __va: pa=0x%llx, offset=0x%lx, size=%zu\n", page_pa, offset, size);
+        return size;
     }
     
     // ===== 查找缓存 =====
@@ -350,12 +355,6 @@ static size_t write_physical_address(phys_addr_t pa, const void __user *buffer, 
     unsigned long offset;
     int i;
     
-    // 验证物理地址
-    if (!pfn_valid(__phys_to_pfn(pa))) {
-        logv("Write: Invalid PFN for pa=0x%llx\n", pa);
-        return 0;
-    }
-    
     // 计算页对齐的物理地址
     page_pa = pa & PAGE_MASK;
     offset = pa & (PAGE_SIZE - 1);
@@ -363,6 +362,17 @@ static size_t write_physical_address(phys_addr_t pa, const void __user *buffer, 
     // 确保写入不跨页
     if (offset + size > PAGE_SIZE) {
         size = PAGE_SIZE - offset;
+    }
+    
+    // 如果是正常 RAM 页，直接通过内核线性映射写入
+    if (pfn_valid(__phys_to_pfn(page_pa))) {
+        char *kva = (char *)__va(page_pa) + offset;
+        if (__arch_copy_from_user(kva, buffer, size) != 0) {
+            logv("Failed to copy from user (__va path)\n");
+            return 0;
+        }
+        logv("Write via __va: pa=0x%llx, offset=0x%lx, size=%zu\n", page_pa, offset, size);
+        return size;
     }
     
     // ===== 查找缓存 =====
