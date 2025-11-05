@@ -53,6 +53,11 @@ KPM_DESCRIPTION("FastScan专用内存读取模块?");
 #include "fscan_prctl.h"
 
 // ========================================================================
+// 模块版本验证
+#define MODULE_MAGIC_VERSION 20241105  // 内置版本号（可自定义）
+#define MODULE_HELLO_MESSAGE "hello world"  // 验证成功返回的消息
+
+// ========================================================================
  
 // 页表相关配置
 int64_t phys_addr_size1 = (1UL << 0x20);
@@ -157,6 +162,7 @@ static inline pid_t my_task_pid_nr_ns(struct task_struct *task, enum pid_type ty
 
 // 虚拟地址转物理地址 - 优化版本（使用已获取的 mm_struct）
 // 修复：避免每次都调用 get_task_mm/mmput，减少内核开销和潜在的内存泄漏
+// 注意：pgtable_entry() 函数已经内部处理了5级页表遍历（pgd->p4d->pud->pmd->pte）
 static uintptr_t _virt_to_phys_with_mm(struct mm_struct *mm, uintptr_t addr) 
 {
     uint64_t* pte_ptr;
@@ -182,6 +188,8 @@ static uintptr_t _virt_to_phys_with_mm(struct mm_struct *mm, uintptr_t addr)
     logv("pgd_base: 0x%lx\n", pgd_base);
     
     // 使用 KPM 提供的安全页表遍历函数
+    // 注意：pgtable_entry() 内部已经支持完整的5级页表遍历：
+    // pgd -> p4d (如果CONFIG_PGTABLE_LEVELS >= 5) -> pud -> pmd -> pte
     pte_ptr = pgtable_entry(pgd_base, addr);
     if (!pte_ptr) {
         logv("Address 0x%lx not mapped (pgtable_entry returned NULL)\n", addr);
@@ -754,7 +762,8 @@ void before_prctl(hook_fargs5_t *args, void *udata)
     
     // ===== 快速过滤：非目标命令直接放行 =====
     if (option != PRCTL_MEM_READ && option != PRCTL_MEM_WRITE && 
-        option != PRCTL_PROCESS_PID && option != PRCTL_MODULE_BASE) {
+        option != PRCTL_PROCESS_PID && option != PRCTL_MODULE_BASE && 
+        option != PRCTL_VERSION_CHECK) {
         return;  // 不处理，让系统正常执行原 prctl
     }
     
@@ -890,6 +899,48 @@ void before_prctl(hook_fargs5_t *args, void *udata)
             args->ret = -ENOENT;  // 模块不存在
         }
     }
+    else if (option == PRCTL_VERSION_CHECK) {
+        // ===== 版本验证（检查模块是否可用）=====
+        struct version_check vc;
+        const char *message = MODULE_HELLO_MESSAGE;
+        size_t message_len = strlen(message) + 1;  // 包含空字符
+        
+        // 从用户空间复制 version_check 结构体
+        if (__arch_copy_from_user(&vc, (void __user *)arg2, sizeof(vc)) != 0) {
+            logv("prctl: failed to copy version_check from user\n");
+            args->ret = -EFAULT;
+            return;
+        }
+        
+        logv("prctl VERSION_CHECK - version=%d (expected=%d)\n", vc.version, MODULE_MAGIC_VERSION);
+        
+        // 检查版本号是否匹配
+        if (vc.version == MODULE_MAGIC_VERSION) {
+            // 版本匹配，返回 hello world 消息
+            
+            // 检查用户缓冲区是否足够大
+            if (vc.message_size < message_len) {
+                logv("prctl: user buffer too small (%zu < %zu)\n", vc.message_size, message_len);
+                args->ret = -ENOSPC;  // 缓冲区太小
+                return;
+            }
+            
+            // 将消息复制到用户空间
+            if (compat_copy_to_user(vc.message, message, message_len) != 0) {
+                logv("prctl: failed to copy message to user\n");
+                args->ret = -EFAULT;
+                return;
+            }
+            
+            logv("prctl version_check successful: version matched, returned '%s'\n", message);
+            args->ret = 0;  // 成功
+        } else {
+            // 版本不匹配
+            logv("prctl version_check failed: version mismatch (%d != %d)\n", 
+                 vc.version, MODULE_MAGIC_VERSION);
+            args->ret = -EINVAL;  // 无效参数（版本不匹配）
+        }
+    }
 }
  
 static long syscall_hook_demo_init(const char *args, const char *event, void *__user reserved)
@@ -901,6 +952,7 @@ static long syscall_hook_demo_init(const char *args, const char *event, void *__
     logv("PRCTL_MEM_WRITE: 0x%x\n", PRCTL_MEM_WRITE);
     logv("PRCTL_PROCESS_PID: 0x%x\n", PRCTL_PROCESS_PID);
     logv("PRCTL_MODULE_BASE: 0x%x\n", PRCTL_MODULE_BASE);
+    logv("PRCTL_VERSION_CHECK: 0x%x (magic version: %d)\n", PRCTL_VERSION_CHECK, MODULE_MAGIC_VERSION);
 
     // 查找所有需要的内核函数
     logv("Looking up kernel functions...\n");

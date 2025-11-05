@@ -52,6 +52,17 @@ struct module_base {
     uint64_t base_address; // 输出：模块基址（内核回写）
 };
 
+// 版本验证结构体（用于检查模块是否可用）
+struct version_check {
+    int version;           // 输入：版本号
+#ifdef __KERNEL__
+    char __user *message;  // 内核空间：用户空间字符串缓冲区指针
+#else
+    char *message;         // 用户空间：接收消息的缓冲区
+#endif
+    size_t message_size;   // 输入：缓冲区大小
+};
+
 // prctl 命令定义
 // 使用不常见的 option 值，伪装成自定义进程控制
 // "MEM" 的 ASCII 码 + 操作类型
@@ -59,12 +70,14 @@ struct module_base {
 #define PRCTL_MEM_WRITE     0x4D454D02  // "MEM\x02"
 #define PRCTL_PROCESS_PID   0x4D454D03  // "MEM\x03" - 获取进程PID
 #define PRCTL_MODULE_BASE   0x4D454D04  // "MEM\x04" - 获取模块基址
+#define PRCTL_VERSION_CHECK 0x4D454D05  // "MEM\x05" - 版本验证（检查模块是否可用）
 
 // 为了兼容性，也可以使用这些别名
 #define OP_READ_MEM      PRCTL_MEM_READ
 #define OP_WRITE_MEM     PRCTL_MEM_WRITE
 #define OP_GET_PID       PRCTL_PROCESS_PID
 #define OP_MODULE_BASE   PRCTL_MODULE_BASE
+#define OP_VERSION_CHECK PRCTL_VERSION_CHECK
 
 // 命令码说明:
 // 0x4D454D01 = 1297239809 (十进制)
